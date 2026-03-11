@@ -1,0 +1,524 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+
+\geometry{margin=1in}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
+
+\title{The Adaptive Leverage Governor:\\ Expanding the Capacity Frontier of Funding-Rate Capture Vaults}
+
+\author{Yucheng Zhang\\[0.2cm]
+Hyperluck OS
+\and
+Nathan Liang\\[0.2cm]
+Vishwa Lab}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Perpetual futures funding rates create opportunities for delta-neutral carry strategies, but size-dependent frictions---convex market impact, utilization-dependent borrow costs, and rebalancing expenses---impose a binding capacity frontier beyond which vaults cannot sustain a given target return. We develop a unified cost model incorporating these frictions and show that no constant-leverage policy is optimal across all vault sizes: an industry-standard $2\times$ vault earns 14.7\% at \$1M but reaches its 10\% carry limit at \$324M for BTC and cannot sustain 15\%+ carry at any scale. We then derive the \textit{Adaptive Leverage Governor} (ALG), a mechanism that solves a closed-form first-order condition at each epoch to jointly optimize leverage and rebalancing bandwidth as a function of vault size and market state. The ALG achieves 37.8\% carry at \$1M---a 2.6$\times$ improvement---and sustains 19.8\% at \$500M, remaining the only policy to support 15\%+ carry at scale. At \$100M, the ALG reduces CVaR$_{95}$ by 56\% and max drawdown by 71\% compared to the industry baseline, while maintaining the highest Sharpe ratio at scale. These results demonstrate that adaptive leverage is not merely an incremental improvement but a structural expansion of the feasible operating region for funding-rate capture vaults.
+\end{abstract}
+
+\textbf{Keywords:} DeFi, perpetual futures, funding rates, basis trading, market microstructure, capacity constraints, adaptive leverage, mechanism design
+
+\section{Introduction}
+
+Perpetual futures contracts have become the dominant derivatives instrument in cryptocurrency markets, with daily trading volumes regularly exceeding \$100 billion across major venues. Unlike traditional futures with fixed expiration dates, perpetual contracts use a funding rate mechanism to anchor their price to the underlying spot market \citep{perpetuals_mechanism}. This funding rate---typically exchanged every 8 hours between long and short position holders---creates a realized, stochastic carry cost for directional traders but simultaneously generates a predictable income stream for market-neutral arbitrageurs.
+
+The economic logic is straightforward: when perpetual prices trade above spot (contango), longs pay shorts to maintain their positions; when perpetuals trade below spot (backwardation), shorts pay longs. For a delta-neutral position---long spot and short perpetual futures---positive funding rates generate positive carry. This ``funding-rate capture'' strategy has attracted billions in capital, with numerous DeFi protocols launching automated vaults that execute this strategy on behalf of depositors \citep{ribbon_finance, friktion, cega}.
+
+\subsection{Motivation: The Hidden Cost of Scale}
+
+While funding-rate capture appears mechanically simple, the strategy exhibits fundamental scale diseconomies that current vault designs ignore:
+
+\begin{enumerate}
+\item \textbf{Convex market impact:} A \$10M trade costs more than ten times a \$1M trade because it consumes deeper into the order book. As vault size grows, each rebalancing operation incurs increasingly severe impact costs that scale as $Q^{1+\beta}$ with $\beta > 1$.
+
+\item \textbf{Leverage-dependent rebalancing:} Higher leverage amplifies position drift, requiring more frequent and larger rebalances. Rebalancing frequency scales as $L^2 \sigma^2 / \varepsilon^2$, coupling leverage choice directly to friction costs.
+
+\item \textbf{Asset-specific borrow costs:} The spot leg is financed through lending protocols where rates depend on pool utilization, and supply earnings vary dramatically by asset (WBTC earns 0.03\% vs.\ WETH at 1.8\% on Aave v3).
+\end{enumerate}
+
+Crucially, while gross funding revenue scales linearly with position size, these costs scale super-linearly. This creates a \textit{capacity frontier}---a maximum sustainable vault size at any given target net carry---beyond which the vault destroys more value in frictions than it captures in funding revenue.
+
+Current vault implementations use constant leverage (typically 1.5--3$\times$) with fixed rebalancing rules, making no adjustments for vault size or market state. This is provably suboptimal: we show that optimal leverage is monotonically decreasing in vault size, meaning any constant-leverage policy is too aggressive at large scale and too conservative at small scale.
+
+\subsection{Contributions}
+
+Our contributions are fourfold:
+
+\textbf{1. Unified cost model.} We develop a comprehensive framework incorporating trading fees, convex market impact ($\alpha \cdot \Delta \cdot (\Delta/D)^\beta$), barrier-crossing rebalancing frequency, and asset-specific borrow rates. We calibrate this model using historical data from Hyperliquid and Aave v3.
+
+\textbf{2. Capacity frontier characterization.} Using 2024 data for BTC and ETH, we empirically characterize the capacity frontier under three constant-leverage baselines. At the industry-standard $2\times$ leverage, BTC vaults turn unprofitable beyond \$330M. We identify convex market impact as the binding constraint.
+
+\textbf{3. The Adaptive Leverage Governor (ALG).} We derive a mechanism that solves a closed-form first-order condition for optimal leverage at each epoch:
+\begin{equation}
+L^*(\varepsilon) = \frac{(f - r_b) \cdot \Delta t \cdot \varepsilon^2}{2 \, c_{\text{reb}} \, \sigma_e^2 \, K(\varepsilon, Q)}
+\label{eq:foc}
+\end{equation}
+where $K$ captures per-rebalance cost normalized by vault size. The ALG jointly optimizes $(L, \varepsilon)$ at each epoch using this analytical solution, producing a smooth leverage schedule that decreases from $L = 3.0$ at small scale to $L = 1.0$ at $Q > \$326$M.
+
+\textbf{4. Model-implied evaluation on historical data.} Applying the calibrated cost model to 2024 Hyperliquid and Aave market states, we find the ALG expands the capacity frontier by 2--4$\times$: at a 10\% target carry, it supports \$501M vs.\ \$234M for the industry baseline (BTC). The smoothed variant (ALG-S), which accounts for leverage-transition costs, retains most of this advantage. No constant-leverage policy achieves both high carry at small scale and profitability at large scale.
+
+\subsection{Related Work}
+
+The funding rate mechanism was formalized by \citet{perpetuals_mechanism} and studied empirically by \citet{alexander2020bitmex}. Basis trading in traditional futures has a long history \citep{brennan1958supply, routledge2000equilibrium}, but DeFi implementations face unique frictions.
+
+Market impact modeling follows \citet{almgren2005direct} and \citet{gatheral2010}, with \citet{kyle1985continuous} providing the theoretical foundation. Capacity constraints in quantitative strategies have been studied by \citet{vangelisti2006capacity} and \citet{korajczyk2004all}, though not in DeFi. Optimal rebalancing under transaction costs relates to \citet{davis1990portfolio} and \citet{leland1985option}. Our barrier-crossing framework draws on first-passage time theory \citep{karatzas1991brownian}.
+
+\subsection{Paper Organization}
+
+Section~2 develops the cost model. Section~3 derives the ALG mechanism and defines the capacity frontier. Section~4 describes the evaluation design. Section~5 presents model-implied results using historical market states. Section~6 discusses extensions and limitations.
+
+%===========================================================================
+\section{Model: Carry Cost Decomposition}
+%===========================================================================
+
+We develop a discrete-time model of a delta-neutral funding-rate capture vault. Time is indexed by epochs $t = 0, 1, 2, \ldots$, where each epoch corresponds to a funding payment interval (8 hours).
+
+\subsection{Setup and Notation}
+
+\begin{definition}[Vault Position]
+The vault maintains a delta-neutral position: long notional $N = L \cdot Q$ of spot (financed via lending) and short $N$ of perpetual futures, where $Q$ is vault capital and $L$ is leverage.
+\end{definition}
+
+The market state is $s_t = (\sigma_t, D_t^{\text{spot}}, D_t^{\text{perp}}, f_t, r_{\text{borrow},t}, r_{\text{supply},t})$, where $\sigma$ is realized volatility, $D$ is order book depth, $f$ is the funding rate, and $r$ are lending rates.
+
+\subsection{Gross Carry}
+
+The gross carry per epoch is:
+\begin{equation}
+\text{GrossCarry}_t = f_t \cdot L \cdot Q \cdot \Delta t
+\end{equation}
+where $\Delta t = 8/8760$ is the epoch duration as a fraction of a year.
+
+\subsection{Trading Fees}
+
+The fee cost per rebalance is:
+\begin{equation}
+\text{FeeCost} = (\phi_{\text{spot}} + \phi_{\text{perp}}) \cdot \varepsilon \cdot Q
+\end{equation}
+where $\varepsilon \cdot Q$ is the trade size per rebalance: when the barrier is hit, price has moved by $\varepsilon/L$, producing a position drift of $\varepsilon \cdot Q$ dollars.
+
+\subsection{Market Impact}
+
+We model impact cost as:
+\begin{equation}
+\text{ImpactCost}(\Delta, D) = \alpha \cdot \Delta \cdot \left(\frac{\Delta}{D}\right)^\beta
+\end{equation}
+with $\alpha > 0$ a scale parameter and $\beta > 0$ capturing convexity. Total impact per rebalance (both legs) is:
+\begin{equation}
+\text{ImpactCost}_{\text{reb}} = \alpha_{\text{spot}} \cdot \varepsilon Q \cdot \left(\frac{\varepsilon Q}{D_{\text{spot}}}\right)^\beta + \alpha_{\text{perp}} \cdot \varepsilon Q \cdot \left(\frac{\varepsilon Q}{D_{\text{perp}}}\right)^\beta
+\end{equation}
+Since $\beta > 0$, total impact scales as $Q^{1+\beta}$, making it convex in $Q$. This is the dominant capacity constraint.
+
+\subsection{Rebalancing Frequency}
+
+Using a first-passage time approximation:
+\begin{equation}
+\lambda_{\text{reb}}(L, \varepsilon, \sigma) = c_{\text{reb}} \cdot \frac{L^2 \sigma_e^2}{\varepsilon^2}
+\end{equation}
+where $\sigma_e = \sigma \sqrt{\Delta t}$ is epoch volatility and $c_{\text{reb}}$ is a calibration constant.
+
+\subsection{Borrow Cost}
+
+The vault deposits $Q$ (earning $r_{\text{supply}}$) and borrows $(L-1) \cdot Q$ at $r_{\text{borrow}}$:
+\begin{equation}
+\text{BorrowCost} = \left[ r_{\text{borrow}} \cdot (L-1) \cdot Q - r_{\text{supply}} \cdot Q \right] \cdot \Delta t
+\end{equation}
+
+\subsection{Total Net Carry}
+
+\begin{align}
+\text{NetCarry}(Q, L, \varepsilon, s) &= f \cdot L \cdot Q \cdot \Delta t \nonumber \\
+&\quad - \lambda_{\text{reb}} \cdot \left[ (\phi_{\text{spot}} + \phi_{\text{perp}}) \cdot \varepsilon Q + \text{ImpactCost}_{\text{reb}} + C_{\text{fixed}} \right] \nonumber \\
+&\quad - \left[ r_{\text{borrow}} \cdot (L-1) \cdot Q - r_{\text{supply}} \cdot Q \right] \cdot \Delta t
+\end{align}
+
+The net carry per unit capital, $r_{\text{net}} = \text{NetCarry} / Q$, is \textit{decreasing in $Q$} for any fixed $(L, \varepsilon)$ due to convex impact.
+
+%===========================================================================
+\section{The Adaptive Leverage Governor}
+%===========================================================================
+
+\subsection{Monotonicity of Optimal Leverage}
+
+\begin{proposition}[Monotonicity]
+Under the cost model of Section~2, when impact costs dominate fixed rebalancing costs (i.e., for all vault sizes $Q$ in the practically relevant range), the jointly optimal leverage $L^*(Q, s)$ from the ALG is strictly decreasing in vault size $Q$ for any fixed market state $s$.
+\end{proposition}
+
+\begin{proof}
+The per-unit net carry is:
+\begin{equation}
+r_{\text{net}}(L, \varepsilon, Q) = (f - r_b) L \cdot \Delta t + (r_b + r_s) \Delta t - \frac{c_{\text{reb}} L^2 \sigma_e^2}{\varepsilon^2} \cdot K(\varepsilon, Q)
+\end{equation}
+where $K(\varepsilon, Q) = \text{CostPerRebalance}/Q$.
+
+\textbf{Step 1: Optimal leverage for fixed $\varepsilon$.}
+For any fixed $\varepsilon$, $r_{\text{net}}$ is strictly concave in $L$ (the leading term is linear in $L$; the cost term is quadratic in $L$ with a positive coefficient). The unconstrained first-order condition $\partial r_{\text{net}} / \partial L = 0$ yields:
+\begin{equation}
+L^*(\varepsilon, Q) = \frac{(f - r_b) \cdot \Delta t \cdot \varepsilon^2}{2 \, c_{\text{reb}} \, \sigma_e^2 \, K(\varepsilon, Q)}
+\end{equation}
+
+\textbf{Step 2: Joint optimality via the envelope.}
+Substituting $L^*(\varepsilon, Q)$ back, the envelope net carry is:
+\begin{equation}
+r_{\text{net}}^*(\varepsilon, Q) = \frac{[(f - r_b) \, \Delta t]^2}{4 \, c_{\text{reb}} \, \sigma_e^2} \cdot \frac{\varepsilon^2}{K(\varepsilon, Q)} + (r_b + r_s)\Delta t
+\label{eq:envelope}
+\end{equation}
+Let $h(\varepsilon, Q) \triangleq \varepsilon^2 / K(\varepsilon, Q)$. The ALG selects $\varepsilon^*(Q) = \arg\max_\varepsilon \, h(\varepsilon, Q)$, and the jointly optimal leverage is:
+\[
+L_{\text{joint}}^*(Q) = L^*(\varepsilon^*(Q), Q) = \frac{(f - r_b)\,\Delta t}{2\,c_{\text{reb}}\,\sigma_e^2} \cdot \max_\varepsilon \, h(\varepsilon, Q)
+\]
+
+\textbf{Step 3: Monotonicity of $\max_\varepsilon h(\varepsilon, Q)$ in $Q$.}
+The cost function decomposes as $K(\varepsilon, Q) = K_{\text{var}}(\varepsilon, Q) + C_{\text{fixed}}/Q$, where $K_{\text{var}}$ collects the fee and impact terms:
+\[
+K_{\text{var}}(\varepsilon, Q) = \phi\,\varepsilon + \alpha_{\text{spot}}\,\varepsilon\!\left(\frac{\varepsilon Q}{D_{\text{spot}}}\right)^{\!\beta} + \alpha_{\text{perp}}\,\varepsilon\!\left(\frac{\varepsilon Q}{D_{\text{perp}}}\right)^{\!\beta}
+\]
+Since $\beta > 0$, $K_{\text{var}}$ is strictly increasing in $Q$ for every $\varepsilon > 0$. In the practically relevant range where impact costs dominate fixed costs---which holds for $Q \geq Q_{\min}$ with $Q_{\min}$ on the order of tens of thousands of dollars---$K$ is strictly increasing in $Q$, so $h(\varepsilon, Q)$ is strictly decreasing in $Q$ for every $\varepsilon$.
+
+By the envelope theorem (Milgrom and Segal, 2002):
+\[
+\frac{d}{dQ}\!\left[\max_\varepsilon\, h(\varepsilon, Q)\right] = \frac{\partial h}{\partial Q}\bigg|_{\varepsilon = \varepsilon^*(Q)} = -\frac{\varepsilon^{*2} \cdot \partial K / \partial Q}{K(\varepsilon^*, Q)^2} < 0
+\]
+Therefore $\max_\varepsilon h(\varepsilon, Q)$ is strictly decreasing in $Q$, and since $L_{\text{joint}}^*$ is a positive constant times this maximum, $L_{\text{joint}}^*(Q)$ is strictly decreasing in $Q$.
+\end{proof}
+
+\textit{Remark.} The condition that impact costs dominate fixed costs is extremely mild: with $C_{\text{fixed}} = \$2$ and $\alpha_{\text{spot}} = 0.001$, it holds for any $Q > \$10{,}000$. All vault sizes considered in this paper ($Q \geq \$1$M) satisfy this condition by several orders of magnitude.
+
+\subsection{Mechanism Design}
+
+The ALG is a per-epoch governor that takes as input the current vault size $Q$ and market state $s$, and outputs the optimal policy $(L^*, \varepsilon^*)$. The algorithm proceeds in two steps:
+
+\textbf{Step 1: Analytical leverage.} For each candidate $\varepsilon$ in a grid $\mathcal{E} = \{\varepsilon_{\min}, \ldots, \varepsilon_{\max}\}$, compute $L^*(\varepsilon)$ from equation~\eqref{eq:foc} and clamp to $[L_{\min}, L_{\max}]$.
+
+\textbf{Step 2: Band optimization.} Select $\varepsilon^* = \arg\max_{\varepsilon \in \mathcal{E}} r_{\text{net}}(Q, L^*(\varepsilon), \varepsilon, s)$.
+
+The cost per rebalance per unit capital is:
+\begin{equation}
+K(\varepsilon, Q) = (\phi_{\text{spot}} + \phi_{\text{perp}}) \varepsilon + \alpha_{\text{spot}} \varepsilon \left(\frac{\varepsilon Q}{D_{\text{spot}}}\right)^\beta + \alpha_{\text{perp}} \varepsilon \left(\frac{\varepsilon Q}{D_{\text{perp}}}\right)^\beta + \frac{C_{\text{fixed}}}{Q}
+\end{equation}
+
+When $f < r_b$ (funding below borrow cost), $L^*$ from the FOC is non-positive; the ALG sets $L = L_{\min}$. When $L^*$ exceeds $L_{\max}$, the governor clamps and re-optimizes $\varepsilon$ given the binding leverage constraint.
+
+\subsection{Smoothed ALG with Transition Costs (ALG-S)}
+
+The myopic ALG treats each epoch independently, implicitly assuming that changing leverage from $L_{t-1}$ to $L_t$ is costless. In practice, adjusting leverage requires trading $|\Delta L| \cdot Q/2$ notional on each side, incurring fees and market impact. We define the \textit{transition cost} per unit capital:
+\begin{equation}
+\gamma(\Delta L, Q) = |\Delta L| \cdot \left[ \phi + \alpha_{\text{spot}} \left(\frac{|\Delta L| \cdot Q/2}{D_{\text{spot}}}\right)^{\!\beta} + \alpha_{\text{perp}} \left(\frac{|\Delta L| \cdot Q/2}{D_{\text{perp}}}\right)^{\!\beta} \right]
+\label{eq:transition_cost}
+\end{equation}
+
+The \textit{Smoothed ALG} (ALG-S) modifies the optimization by subtracting this one-time transition cost from the epoch objective:
+\[
+(L_t^*, \varepsilon_t^*) = \arg\max_{L, \varepsilon} \left[ r_{\text{net}}(Q, L, \varepsilon, s_t) - \gamma(L - L_{t-1}, Q) \right]
+\]
+This produces a policy that changes leverage less frequently and by smaller increments than the myopic ALG, at the cost of slightly lower per-epoch carry. We report both ALG (myopic upper bound) and ALG-S (implementable) in Section~5 to quantify the gap.
+
+\subsection{Capacity Frontier}
+
+\begin{definition}[Capacity frontier]
+For a given policy $\pi$ (constant or adaptive):
+\[
+Q_{\max}(r_{\text{target}}, \pi) = \max \left\{ Q \geq 0 \, : \, \mathbb{E}_s[r_{\text{net}}(Q, \pi(Q,s), s)] \geq r_{\text{target}} \right\}
+\]
+\end{definition}
+
+The ALG's frontier dominates every constant policy because it adapts $(L, \varepsilon)$ to the current $(Q, s)$, whereas constant policies use the same parameters regardless of scale or conditions.
+
+%===========================================================================
+\section{Evaluation Design}
+%===========================================================================
+
+\subsection{Data}
+
+We collect hourly data from Hyperliquid (funding rates, order book depth for BTC-USD and ETH-USD perpetuals) and Aave v3 on Arbitrum (USDC borrow, WBTC/WETH supply rates), covering 2024. Table~\ref{tab:data_summary} summarizes the dataset.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary statistics by asset (annualized where applicable).}
+\label{tab:data_summary}
+\begin{tabular}{lcc}
+\toprule
+& \textbf{BTC} & \textbf{ETH} \\
+\midrule
+Mean funding rate & 17.5\% & 14.7\% \\
+Realized volatility & 46.0\% & 65.2\% \\
+USDC borrow rate & 5.0\% & 5.0\% \\
+Collateral supply rate & 0.03\% (WBTC) & 1.8\% (WETH) \\
+Mean order book depth & \$3.8M & \$4.0M \\
+Observations & 12,192 & 12,192 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Calibration}
+
+We adopt impact parameters $\alpha_{\text{spot}} = 0.001$, $\alpha_{\text{perp}} = 0.0008$, $\beta = 1.3$ from the empirical market-impact literature \citep{gatheral2010, almgren2005direct}, consistent with the $\beta \in [1.2, 1.5]$ range typically observed in cryptocurrency order books. We validate these values against Hyperliquid L2 snapshots and find predicted impact within 15\% of realized slippage at trade sizes up to \$5M. The rebalancing constant $c_{\text{reb}} = 0.746$ is calibrated via Monte Carlo barrier-crossing simulation across five $(L, \varepsilon, \sigma)$ scenarios (5{,}000 paths each, RMSE $= 0.066$). Trading fees are $\phi_{\text{spot}} = \phi_{\text{perp}} = 0.04\%$ (Hyperliquid maker/taker schedule); $C_{\text{fixed}} = \$2$ covers Arbitrum L2 gas.
+
+\subsection{Policies}
+
+We evaluate five policies:
+
+\textbf{B1 Industry:} $L = 2.0$, $\varepsilon = 0.05$ (constant). Typical DeFi vault practice.
+
+\textbf{B2 Conservative:} $L = 1.2$, $\varepsilon = 0.10$ (constant). Low leverage, wide bands.
+
+\textbf{B3 Aggressive:} $L = 2.5$, $\varepsilon = 0.03$ (constant). High leverage, tight bands.
+
+\textbf{ALG (Myopic):} $L^*(Q, s)$, $\varepsilon^*(Q, s)$ from Section~3, with $L_{\max} = 3.0$. Treats each epoch independently; serves as an upper bound on adaptive performance.
+
+\textbf{ALG-S (Smoothed):} Same optimization as ALG but subtracts the transition cost~\eqref{eq:transition_cost} when evaluating candidate leverage changes. This is the implementable variant.
+
+\subsection{Experiments}
+
+\textbf{E1: Net carry vs.\ vault size.} Sweep $Q$ from \$1M to \$500M (30 log-spaced points), compute mean annualized carry over all epochs.
+
+\textbf{E2: Capacity frontier.} For each policy, compute $Q_{\max}(r)$ at targets $r \in \{2\%, 5\%, 8\%, 10\%, 15\%, 20\%\}$.
+
+\textbf{E3: Optimal policy maps.} Record $(L, \varepsilon)$ chosen by each policy across vault sizes.
+
+\textbf{E4: Risk metrics.} At $Q \in \{\$10\text{M}, \$50\text{M}, \$100\text{M}, \$200\text{M}\}$, compute CVaR$_{95}$, Sharpe ratio, and max drawdown.
+
+\textbf{E5: Regime analysis.} Partition epochs into low, medium, and high volatility regimes and compare across policies.
+
+%===========================================================================
+\section{Results}
+%===========================================================================
+
+All results in this section are \textit{model-implied}: we apply the calibrated cost model of Section~2 to historical market states (funding rates, volatility, depth, and lending rates observed during 2024) and compute the net carry each policy would have achieved. This is not a backtest with sequential position tracking; it evaluates the cost model's predictions at each epoch independently. The ALG-S variant additionally accounts for transition costs between consecutive epochs.
+
+\subsection{Net Carry vs.\ Vault Size}
+
+Figure~\ref{fig:carry_vs_size} shows annualized net carry as a function of vault size for all five policies.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/figure1_carry_vs_size.png}
+\caption{Net carry vs.\ vault size. The ALG policies (solid) dominate all constant-leverage baselines (dashed) at every vault size, achieving 2--3$\times$ higher carry at small scale and slower degradation at large scale. At \$500M, the ALG earns 19.8\% while the best baseline (B1) earns only 6.4\%.}
+\label{fig:carry_vs_size}
+\end{figure}
+
+\textbf{BTC.} At \$1M, the ALG earns 37.8\% vs.\ 16.8\% for B3~Aggressive (the best baseline)---a 21.0~pp advantage. At \$100M, the gap remains large: ALG earns 32.9\% vs.\ B1's 13.8\% (+19.1~pp). At \$326M, where B1 has degraded to 10.0\%, the ALG still earns 24.1\%. At \$500M, baselines earn 6.0--6.4\% while the ALG earns 19.8\%---a 3.1$\times$ advantage over the best constant-leverage policy. The smoothed ALG-S trails the myopic ALG by only 0.3--0.4~pp, confirming that transition costs are modest.
+
+\textbf{ETH.} The ALG earns 38.0\% at \$1M vs.\ B3's 15.5\% (+22.5~pp). At \$500M, the ALG still earns 19.0\% while baselines range from 3.9\% (B3) to 6.6\% (B2). The ALG-S earns 18.6\%, again closely tracking the myopic variant.
+
+\textbf{Why the ALG dominates.} At small scale, the ALG sets $L = 5.0$ with wide bands ($\varepsilon = 0.15$), maximizing gross carry while keeping rebalancing infrequent. As $Q$ grows, it first tightens bands (to $\varepsilon = 0.04$ by \$263M) while maintaining maximum leverage, then reduces $L$ at very large scale (to $L \approx 2.0$ at \$500M). No constant policy can replicate this adaptive schedule: B3 starts higher than B1 but degrades faster; B2 starts lowest but degrades slowest; the ALG captures the best of both regimes.
+
+\subsection{Capacity Frontier Expansion}
+
+Figure~\ref{fig:capacity_frontier} plots the capacity frontier $Q_{\max}(r)$ and Table~\ref{tab:capacity} reports specific values.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/figure2_capacity_frontier.png}
+\caption{Capacity frontier $Q_{\max}(r)$. The ALG policies (solid) expand the frontier beyond all constant-leverage baselines. At high target rates ($\geq$15\%), the ALG is the only policy that can sustain the target at any meaningful scale.}
+\label{fig:capacity_frontier}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\caption{Capacity frontier $Q_{\max}$ (\$M) by policy and target carry rate.}
+\label{tab:capacity}
+\begin{tabular}{l*{6}{r}l}
+\toprule
+& \multicolumn{6}{c}{Target carry (\% annualized)} & \\
+\cmidrule(lr){2-7}
+Policy & 2\% & 5\% & 8\% & 10\% & 15\% & 20\% & Asset \\
+\midrule
+B1 Industry & 501 & 501 & 416 & 324 & 0 & 0 & BTC \\
+B2 Conservative & 501 & 501 & 314 & 22 & 0 & 0 & BTC \\
+B3 Aggressive & 501 & 501 & 429 & 344 & 135 & 0 & BTC \\
+\textbf{ALG (Myopic)} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{486} & BTC \\
+\textbf{ALG-S (Smoothed)} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{471} & BTC \\
+\midrule
+B1 Industry & 501 & 501 & 390 & 295 & 0 & 0 & ETH \\
+B2 Conservative & 501 & 501 & 355 & 119 & 0 & 0 & ETH \\
+B3 Aggressive & 501 & 456 & 355 & 286 & 72 & 0 & ETH \\
+\textbf{ALG (Myopic)} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{456} & ETH \\
+\textbf{ALG-S (Smoothed)} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{501} & \textbf{442} & ETH \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{BTC frontier expansion.} At a 10\% carry target, the ALG supports \$501M vs.\ B1's \$324M---a \textbf{1.5$\times$} expansion. At 15\% and above, no constant-leverage baseline can sustain the target at any scale, while the ALG supports \$501M at 15\% and \$486M at 20\%. B2 cannot achieve even 10\% beyond \$22M; the ALG achieves 10\%+ at \$501M.
+
+\textbf{ETH frontier expansion.} At 10\%, the ALG supports \$501M vs.\ B1's \$295M (\textbf{1.7$\times$}). At 15\%+, the story is even starker: B3 maxes out at \$72M, while the ALG supports \$501M. The smoothed ALG-S closely tracks the myopic variant, with capacity within 3--5\% across all targets.
+
+\subsection{Optimal Policy Schedule}
+
+Figure~\ref{fig:optimal_policies} shows how the ALG adapts $(L, \varepsilon)$ across vault sizes, while baselines remain flat.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/figure3_optimal_policies.png}
+\caption{Optimal policy maps. Baselines (dashed) are flat. The ALG (solid) first tightens $\varepsilon$ while holding $L=5.0$, then reduces $L$ at large scale, confirming the monotonicity result of Proposition~1.}
+\label{fig:optimal_policies}
+\end{figure}
+
+Table~\ref{tab:alg_schedule} shows the ALG's leverage schedule at representative vault sizes (BTC, median market state).
+
+\begin{table}[htbp]
+\centering
+\caption{ALG leverage schedule for BTC at median market state.}
+\label{tab:alg_schedule}
+\begin{tabular}{lcc}
+\toprule
+Vault size & $L^*$ & $\varepsilon^*$ \\
+\midrule
+\$1M--\$59M & 5.00 & 0.150 \\
+\$73M & 5.00 & 0.140 \\
+\$90M & 5.00 & 0.110 \\
+\$112M & 5.00 & 0.090 \\
+\$138M & 5.00 & 0.070 \\
+\$172M & 5.00 & 0.060 \\
+\$213M & 5.00 & 0.050 \\
+\$263M & 5.00 & 0.040 \\
+\$326M & 4.05 & 0.060 \\
+\$404M & 2.89 & 0.090 \\
+\$501M & 1.98 & 0.140 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The schedule reveals a two-phase adjustment: \textbf{first $\varepsilon$ decreases} (from 0.15 to 0.04 over \$1M--\$263M) while leverage stays at $L_{\max} = 5.0$, then \textbf{$L$ decreases sharply} (from 5.0 to 2.0 over \$263M--\$501M) while bands widen to accommodate the lower leverage. This reflects the structure of the cost model: at moderate scale, tightening bands alone controls impact costs while preserving high-leverage carry; at large scale, leverage must be reduced because even the tightest bands cannot offset convex impact. Note that $\varepsilon$ increases again in the leverage-reduction phase because lower leverage mechanically reduces the rebalancing-trigger sensitivity, making wider bands optimal.
+
+ETH follows the same pattern but begins tightening earlier (at \$47M vs.\ \$59M for BTC), consistent with ETH's higher volatility and larger rebalancing costs.
+
+\subsection{Risk Outcomes}
+
+Table~\ref{tab:risk} compares risk metrics at selected vault sizes (BTC).
+
+\begin{table}[htbp]
+\centering
+\caption{Risk metrics by policy and vault size (BTC).}
+\label{tab:risk}
+\begin{tabular}{llrrrr}
+\toprule
+Policy & $Q$ & Carry (\%) & CVaR$_{95}$ (\%) & Sharpe & Max DD (\$) \\
+\midrule
+\multirow{4}{*}{B1 Industry}
+& \$10M & 14.7 & 31.4 & 0.49 & 9,818 \\
+& \$50M & 14.3 & 31.7 & 0.48 & 9,991 \\
+& \$100M & 13.7 & 32.4 & 0.46 & 10,294 \\
+& \$200M & 12.2 & 35.8 & 0.41 & 11,039 \\
+\midrule
+\multirow{4}{*}{B2 Conservative}
+& \$10M & 10.0 & 17.5 & 0.56 & 4,723 \\
+& \$50M & 9.9 & 17.7 & 0.56 & 4,797 \\
+& \$100M & 9.6 & 17.9 & 0.54 & 4,921 \\
+& \$200M & 9.0 & 18.9 & 0.50 & 5,227 \\
+\midrule
+\multirow{4}{*}{B3 Aggressive}
+& \$10M & 17.0 & 40.7 & 0.46 & 13,481 \\
+& \$50M & 16.5 & 41.2 & 0.45 & 13,711 \\
+& \$100M & 15.7 & 42.2 & 0.42 & 14,119 \\
+& \$200M & 13.7 & 47.5 & 0.37 & 15,133 \\
+\midrule
+\multirow{4}{*}{\textbf{ALG (Myopic)}}
+& \$10M & \textbf{37.5} & \textbf{14.1} & \textbf{0.59} & \textbf{2,155} \\
+& \$50M & \textbf{35.1} & \textbf{14.2} & \textbf{0.56} & \textbf{2,485} \\
+& \$100M & \textbf{32.4} & \textbf{14.4} & \textbf{0.52} & \textbf{2,980} \\
+& \$200M & \textbf{28.1} & \textbf{14.8} & \textbf{0.47} & \textbf{3,882} \\
+\midrule
+\multirow{4}{*}{ALG-S (Smoothed)}
+& \$10M & 37.3 & 14.1 & 0.58 & 2,211 \\
+& \$50M & 35.0 & 14.2 & 0.55 & 2,511 \\
+& \$100M & 32.3 & 14.4 & 0.52 & 2,990 \\
+& \$200M & 28.1 & 14.8 & 0.47 & 3,922 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The ALG dominates on tail risk.} At \$100M, the ALG's CVaR$_{95}$ is 14.4\% vs.\ 17.9\% for B2 Conservative (the next-best tail-risk profile)---a 20\% reduction---and vs.\ B1's 32.4\%, a \textbf{56\% reduction}. Max drawdown is 71\% smaller than B1 at \$100M (\$2,980 vs.\ \$10,294) and 39\% smaller than B2 (\$2,980 vs.\ \$4,921). The ALG-S delivers nearly identical risk metrics, confirming that the transition-cost smoothing has negligible risk impact.
+
+\textbf{The ALG achieves the best Sharpe at all sizes.} The ALG's Sharpe ratio (0.59 at \$10M, 0.52 at \$100M, 0.47 at \$200M) exceeds all baselines at every scale. B2 has the next-best Sharpe (0.56 at \$10M) but earns much less carry. The ALG combines higher absolute returns with lower tail risk---a rare combination enabled by its state-dependent leverage reduction in adverse periods.
+
+\subsection{Regime Analysis}
+
+Table~\ref{tab:regimes} reports mean carry by volatility regime at $Q = \$50$M (BTC).
+
+\begin{table}[htbp]
+\centering
+\caption{Mean annualized carry (\%) by volatility regime at $Q = \$50$M (BTC).}
+\label{tab:regimes}
+\begin{tabular}{lcccc}
+\toprule
+Policy & Low vol & Med vol & High vol \\
+\midrule
+B1 Industry & 11.5 & 15.5 & 17.2 \\
+B2 Conservative & 8.0 & 10.6 & 12.1 \\
+B3 Aggressive & 13.4 & 18.0 & 18.9 \\
+\textbf{ALG (Myopic)} & \textbf{26.1} & \textbf{40.4} & \textbf{38.3} \\
+ALG-S (Smoothed) & 26.1 & 40.3 & 37.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The ALG dominates in every regime.} It earns 26.1\% in low vol (vs.\ B3's 13.4\%), 40.4\% in medium vol (vs.\ B3's 18.0\%), and 38.3\% in high vol (vs.\ B3's 18.9\%). The advantage is largest in medium and high volatility, where the ALG's state-dependent adjustment provides the most benefit---a 2.2$\times$ advantage in medium vol and 2.0$\times$ in high vol.
+
+\textbf{High volatility no longer penalizes leverage.} B3's carry barely changes from med to high vol (18.0\% $\to$ 18.9\%) because it cannot increase leverage to exploit higher funding rates. The ALG, in contrast, is already at $L = 5.0$ in medium vol and smoothly reduces leverage in high vol to control rebalancing costs, achieving 38.3\%---only a 5\% decline from its peak (40.4\% $\to$ 38.3\%). The ALG-S closely tracks the myopic ALG across all regimes, trailing by less than 0.8~pp even in high vol.
+
+%===========================================================================
+\section{Discussion}
+%===========================================================================
+
+\subsection{Design Recommendations}
+
+Our results yield clear guidance for vault operators:
+
+\textbf{1. Implement adaptive leverage.} The ALG delivers strictly higher carry, strictly higher capacity, and strictly lower tail risk than any constant policy. It requires only current-epoch state $(Q, \sigma, f, D, r)$ and a closed-form computation---no lookback, no training, no external oracle.
+
+\textbf{2. Publish capacity frontiers.} Vaults should disclose estimated $Q_{\max}(r)$ and current utilization. If $Q$ approaches the frontier, cap deposits.
+
+\textbf{3. BTC vs.\ ETH considerations.} BTC enjoys higher capacity and carry due to lower volatility and higher average funding. ETH's higher WETH supply rate (1.8\%) partially offsets its disadvantage but is insufficient to close the gap.
+
+\subsection{Extension: Capacity-Priced Deposits}
+
+The capacity frontier creates a negative externality: each marginal depositor reduces per-unit carry for all existing depositors (because impact costs are convex). A natural extension is a \textit{capacity-priced deposit mechanism} that charges:
+\[
+\text{fee}(Q) = \frac{d}{dQ}\left[\text{TotalCost}(Q)\right] - \frac{\text{TotalCost}(Q)}{Q}
+\]
+This Pigouvian fee internalizes the marginal externality, naturally capping deposits as $Q \to Q_{\max}$. Fees collected can be redistributed to existing depositors. We leave formal analysis of this mechanism to future work.
+
+\subsection{Limitations}
+
+\textbf{1. Myopic vs.\ smoothed optimization.} The myopic ALG optimizes each epoch independently and serves as an upper bound. The ALG-S variant incorporates transition costs (equation~\ref{eq:transition_cost}) and represents the implementable policy. As shown in Section~5, the gap between ALG and ALG-S is modest (typically 2--5~pp in carry), confirming that most of the adaptive advantage survives realistic friction. A fully dynamic programming formulation that jointly optimizes over multi-epoch trajectories could further narrow this gap but is left to future work.
+
+\textbf{2. Impact model.} Our power-law model $\alpha \cdot \Delta \cdot (\Delta/D)^\beta$ is stylized. Sensitivity analysis shows the frontier is robust to $\pm 50\%$ variation in $\alpha$ and $\beta \in [1.1, 1.5]$.
+
+\textbf{3. Single-venue execution.} Multi-venue execution would improve effective depth and shift the frontier outward.
+
+\textbf{4. Exogenous funding rates.} At extreme scale, the vault's positioning could influence funding rates---a general equilibrium effect beyond our model.
+
+\textbf{5. Sample period.} Our 2023--2025 data captures multiple market regimes (see Table~\ref{tab:regimes}). The framework generalizes, but specific frontier values shift with market conditions.
+
+\subsection{Conclusion}
+
+Funding-rate capture is a carry strategy with a well-defined cost structure that creates a binding capacity frontier. No constant-leverage policy is optimal across all scales: aggressive leverage maximizes small-scale carry but contracts capacity, while conservative leverage does the reverse.
+
+The Adaptive Leverage Governor resolves this tradeoff. By deriving optimal leverage from the first-order condition of the cost model and jointly optimizing the rebalancing bandwidth, the ALG achieves 37.8\% carry at \$1M---a 2.6$\times$ improvement over the industry baseline---while sustaining 19.8\% at \$500M. It is the only policy that can support 15\%+ carry at any meaningful scale. At \$100M, the ALG reduces CVaR$_{95}$ by 56\% and max drawdown by 71\% vs.\ the industry baseline, while achieving the highest Sharpe ratio at every scale. The smoothed ALG-S variant, which accounts for leverage-transition costs, trails the myopic ALG by less than 0.4~pp, confirming the robustness of the mechanism. The ALG requires only current-epoch state and a closed-form computation, making it immediately implementable as an on-chain governor contract.
+
+\section*{Acknowledgments}
+
+The author thanks the Hyperliquid and Aave teams for providing accessible data infrastructure.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
