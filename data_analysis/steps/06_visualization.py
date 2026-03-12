@@ -46,7 +46,7 @@ def _policy_kw(policy):
 
 
 def _format_dollar_axis(ax, axis='x'):
-    """Format a log-scale axis with readable dollar labels like $1M, $10M, $100M.
+    """Format a log-scale axis with readable dollar labels like $1M, $10M, $100M, $500M.
 
     Assumes the plotted data is already in millions (i.e., Q / 1e6).
     """
@@ -62,6 +62,10 @@ def _format_dollar_axis(ax, axis='x'):
 
     target = ax.xaxis if axis == 'x' else ax.yaxis
     target.set_major_formatter(mticker.FuncFormatter(fmt))
+    # Explicitly set ticks so $500M is visible on log-scale axes
+    if axis == 'x':
+        target.set_major_locator(mticker.FixedLocator([1, 10, 100, 500]))
+        ax.set_xlim(left=0.8, right=600)
 
 
 def generate_figure1_carry_vs_size(results_df):
