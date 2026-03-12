@@ -15,21 +15,50 @@ import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
+import argparse
 
 
 class ExperimentRunner:
     """Run all experiments and generate results."""
     
-    def __init__(self, cost_model, data_df, policies):
+    def __init__(self, cost_model, data_df, policies, mode='full'):
         """
         Args:
             cost_model: VaultCostModel instance
             data_df: Master dataset
             policies: Dict of policy_name -> Policy instance
+            mode: One of full, quick, test
         """
         self.model = cost_model
         self.data = data_df
         self.policies = policies
+        self.mode = mode
+
+    def _default_q_grid(self, experiment):
+        """Return a mode-specific vault-size grid."""
+        sizes = {
+            'E1': {'full': 30, 'quick': 15, 'test': 5},
+            'E2': {'full': 200, 'quick': 60, 'test': 20},
+            'E3': {'full': 30, 'quick': 15, 'test': 5},
+        }
+        points = sizes[experiment][self.mode]
+        return np.logspace(6, 8.7, points)
+
+    def _default_r_targets(self):
+        """Return mode-specific return targets for the frontier."""
+        if self.mode == 'full':
+            return [0.02, 0.05, 0.08, 0.10, 0.15, 0.20]
+        if self.mode == 'quick':
+            return [0.05, 0.08, 0.10, 0.15]
+        return [0.05, 0.10]
+
+    def _default_q_test(self):
+        """Return mode-specific test vault sizes."""
+        if self.mode == 'full':
+            return [10_000_000, 50_000_000, 100_000_000, 200_000_000]
+        if self.mode == 'quick':
+            return [10_000_000, 100_000_000]
+        return [10_000_000]
 
     @staticmethod
     def _reset_policy(policy):
@@ -52,7 +81,7 @@ class ExperimentRunner:
         print("="*70)
         
         if Q_grid is None:
-            Q_grid = np.logspace(6, 8.7, 30)  # $1M to $500M
+            Q_grid = self._default_q_grid('E1')
         
         results = []
         
@@ -108,10 +137,10 @@ class ExperimentRunner:
         print("="*70)
         
         if Q_grid is None:
-            Q_grid = np.logspace(6, 8.7, 200)
+            Q_grid = self._default_q_grid('E2')
         
         if r_targets is None:
-            r_targets = [0.02, 0.05, 0.08, 0.10, 0.15, 0.20]  # 2% to 20%
+            r_targets = self._default_r_targets()
         
         # First, get mean carry for each (policy, Q)
         print("\nCalculating mean carry for all (policy, Q) pairs...")
@@ -184,7 +213,7 @@ class ExperimentRunner:
         print("="*70)
         
         if Q_grid is None:
-            Q_grid = np.logspace(6, 8.7, 30)
+            Q_grid = self._default_q_grid('E3')
         
         results = []
         
@@ -235,7 +264,7 @@ class ExperimentRunner:
         print("="*70)
         
         if Q_test is None:
-            Q_test = [10_000_000, 50_000_000, 100_000_000, 200_000_000]
+            Q_test = self._default_q_test()
         
         results = []
         
@@ -414,6 +443,15 @@ if __name__ == '__main__':
     import sys
     import importlib.util
 
+    parser = argparse.ArgumentParser(description="Run all experiments")
+    parser.add_argument(
+        "--mode",
+        choices=["full", "quick", "test"],
+        default="full",
+        help="Experiment grid size to use",
+    )
+    args = parser.parse_args()
+
     # Import cost model
     spec = importlib.util.spec_from_file_location("cost_model", "./02_cost_model.py")
     cm = importlib.util.module_from_spec(spec)
@@ -464,7 +502,7 @@ if __name__ == '__main__':
 
         print(f"\n  Policies: {list(policies.keys())}")
 
-        runner = ExperimentRunner(model, asset_data, policies)
+        runner = ExperimentRunner(model, asset_data, policies, mode=args.mode)
         results_by_asset[asset] = runner.run_all_experiments(asset_label=asset.lower())
 
     # Combined comparison files

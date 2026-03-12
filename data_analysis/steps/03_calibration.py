@@ -7,6 +7,10 @@ Calibrate impact parameters α and β (or use literature values).
 Fit Aave rate curve.
 """
 
+import os
+
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize, curve_fit

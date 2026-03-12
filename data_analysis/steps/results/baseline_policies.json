@@ -1,0 +1,17 @@
+{
+  "B1_Industry": {
+    "L": 2.0,
+    "epsilon": 0.05,
+    "name": "B1 (Industry Standard)"
+  },
+  "B2_Conservative": {
+    "L": 1.2,
+    "epsilon": 0.1,
+    "name": "B2 (Conservative)"
+  },
+  "B3_Aggressive": {
+    "L": 2.5,
+    "epsilon": 0.03,
+    "name": "B3 (Aggressive)"
+  }
+}

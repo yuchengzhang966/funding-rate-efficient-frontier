@@ -5,6 +5,10 @@ Visualization and Results Export
 Generate all figures for the paper and extract placeholder values.
 """
 
+import os
+
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
