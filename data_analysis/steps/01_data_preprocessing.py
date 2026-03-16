@@ -146,7 +146,7 @@ class DataPreprocessor:
         """
         Calculate realized volatility from price returns.
         
-        CRITICAL: Must use actual price data, not funding rates!
+        CRITICAL: Must use actual price data
         Uses mid_price from depth data.
         
         Args:
