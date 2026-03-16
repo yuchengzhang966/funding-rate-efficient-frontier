@@ -732,46 +732,80 @@ class DeltaNeutralSimulator:
 
         # Target: short C*L notional on perp, hold C*L notional in spot ETH
         # This means we earn L× the funding rate on our capital
+        #
+        # Capital allocation for leverage L:
+        #   α × C → perp margin on Hyperliquid
+        #   (1-α) × C → buy ETH, supply to Aave, borrow loop
+        #
+        # After Aave looping at LTV ratio r:
+        #   Total ETH value = (1-α) × C / (1-r)
+        #   Total debt = (1-α) × C × r / (1-r)
+        #   Aave HF = (total_ETH_value × liq_threshold) / debt
+        #          = liq_threshold / r
+        #
+        # For delta neutral: perp short notional = total ETH value
+        # Effective leverage: L_eff = (1-α) / (1-r)
+        #
+        # Solve for r given target L and α:
+        #   r = 1 - (1-α)/L
+        #
+        # We choose α to keep perp margin ratio ≥ 10% of notional
+        # and keep Aave HF ≥ 1.5 (safe)
+        #
+        # HF constraint: liq_threshold / r ≥ 1.5
+        #   → r ≤ liq_threshold / 1.5 = 0.825/1.5 = 0.55
+        #
+        # For L=2: r = 1 - (1-α)/2
+        #   HF ≥ 1.5 → r ≤ 0.55 → 1-(1-α)/2 ≤ 0.55 → (1-α) ≥ 0.9 → α ≤ 0.1
+        #   So with α=0.10: r = 1 - 0.9/2 = 0.55, HF = 0.825/0.55 = 1.50 ✓
+        #   Perp margin = 0.10 × C, notional = 0.9C/0.45 = 2C
+        #   Margin ratio = 0.1C / 2C = 5% (tight but Hyperliquid allows it)
+
+        liq_threshold = self.aave.effective_liq_threshold
+        target_hf = 1.2  # Minimum starting health factor (1.1 too low, 1.2+ ok)
+
+        # Max LTV from HF constraint
+        max_r = liq_threshold / target_hf  # 0.825/1.5 = 0.55
+
+        # Solve for α: r = 1 - (1-α)/L ≤ max_r → α ≤ 1 - L*(1-max_r)
+        alpha_max_from_hf = 1 - L * (1 - max_r)
+
+        # Perp margin constraint: α×C ≥ 0.05 × notional = 0.05 × (1-α)×C/(1-r)
+        # We'll set a minimum α from perp margin ratio
+        min_margin_ratio = 0.05  # 5% of notional minimum (20× max perp leverage)
+        # α ≥ min_margin_ratio × L (since notional = L×C)
+        alpha_min_from_margin = min_margin_ratio * L
+
+        # Choose α
+        if L <= 1.0:
+            alpha = 0.5  # Simple 50/50 split for no leverage
+        else:
+            alpha = max(alpha_min_from_margin, min(alpha_max_from_hf, 0.5))
+
+        # If alpha is too high, we can't achieve target leverage
+        if alpha >= 1.0:
+            raise ValueError(
+                f"Cannot achieve {L}× leverage safely. "
+                f"Max leverage with HF≥{target_hf}: "
+                f"{1/(1-max_r) * (1-alpha_min_from_margin):.1f}×"
+            )
+
+        perp_margin = alpha * C
+        spot_capital = (1 - alpha) * C
+
+        # Aave LTV needed
+        r = 1 - spot_capital / (C * L) if L > 1 else 0
+        r = max(0, r)
+
+        if r >= max_ltv:
+            # Can't achieve full leverage, reduce
+            r = max_ltv * 0.95
+            actual_notional = spot_capital / (1 - r)
+            L = actual_notional / C
+            print(f"  Warning: Adjusted to {L:.2f}× leverage (Aave LTV limit)")
 
         target_notional = C * L
         target_eth = target_notional / P
-
-        # Perp margin: need enough to not get liquidated easily
-        # Use fraction of capital that keeps both Aave HF > 1.5 and HL margin safe
-        # More capital to perp margin → less to Aave → lower Aave leverage → safer HF
-        # Trade-off: too much margin means less leveraged spot exposure
-        perp_margin_ratio = max(0.15, 1.0 / (L * 2))  # At least 15% of notional
-        perp_margin = target_notional * perp_margin_ratio
-
-        # Remaining capital for spot ETH purchase
-        spot_capital = C - perp_margin
-
-        if spot_capital <= 0:
-            raise ValueError(
-                f"Not enough capital. Need ${perp_margin:,.0f} for perp margin "
-                f"but only have ${C:,.0f} total."
-            )
-
-        # Buy ETH with spot_capital → supply to Aave → borrow → buy more
-        # After looping: total ETH = spot_capital / (1 - used_ltv) / P
-        # We want total ETH = target_eth
-        # So: spot_capital / (1 - used_ltv) = target_notional
-        # used_ltv = 1 - spot_capital / target_notional
-        used_ltv = 1 - spot_capital / target_notional
-
-        if used_ltv < 0:
-            # Don't need Aave at all (L ≈ 1)
-            used_ltv = 0
-
-        if used_ltv >= max_ltv:
-            # Need to reduce target or increase margin efficiency
-            # Adjust: use max_ltv and get whatever leverage we can
-            actual_total = spot_capital / (1 - max_ltv * 0.95)  # 95% of max for safety
-            target_eth = actual_total / P
-            target_notional = actual_total
-            used_ltv = max_ltv * 0.95
-            print(f"  Warning: Adjusted notional to ${actual_total:,.0f} "
-                  f"(max safe leverage with this capital split)")
 
         # Execute: supply ETH, borrow USDC
         self.spot_eth = target_eth
