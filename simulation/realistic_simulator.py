@@ -35,11 +35,23 @@ class HyperliquidAccount:
 
     Hyperliquid mechanics (as of 2024):
     - Cross-margin by default
-    - Maintenance margin: 3% of position notional for ETH
-    - Funding: paid every 8 hours (hourly accrual on HL)
-    - Trading fee: 0.035% taker, 0.01% maker (we use taker)
-    - Liquidation: position closed at mark price when margin < maintenance
-    - Liquidation penalty: 0.5% of position notional
+    - Maintenance margin: derived from max leverage and margin tiers
+      (not a universal fixed rate — see margin-tiers docs)
+    - Funding: hourly accrual
+    - Trading fee: tiered by 14-day rolling volume
+      Base tier: 0.045% taker, 0.015% maker
+    - Liquidation: staged (partial for >$100k notional), not instant full close
+      Backstop only when equity < 2/3 of maintenance
+
+    Health factor (analogous to Aave):
+        HF = account_equity / maintenance_margin_requirement
+        HF < 1.0 → liquidation triggered
+
+    This makes risk comparable across both legs of the strategy.
+
+    Simplification: we use a single maintenance_margin_rate rather than
+    the full tiered schedule. This is acceptable for positions within a
+    single margin tier.
     """
     margin_deposited: float = 0.0       # USDC deposited as margin
     position_size_eth: float = 0.0      # ETH units (positive = short notional)
@@ -51,10 +63,13 @@ class HyperliquidAccount:
     liquidation_loss: float = 0.0
 
     # Protocol parameters
-    maintenance_margin_rate: float = 0.03    # 3% for ETH
-    taker_fee_rate: float = 0.00035          # 0.035%
-    maker_fee_rate: float = 0.0001           # 0.01%
-    liquidation_penalty_rate: float = 0.005  # 0.5%
+    # ETH max leverage = 50×, initial margin = 1/50 = 2%, maintenance = 1%
+    # But for larger positions, tiers increase this. Using 2% as conservative
+    # default for positions in the base tier (<$1M notional).
+    maintenance_margin_rate: float = 0.02    # 2% base tier for ETH
+    taker_fee_rate: float = 0.00045          # 0.045% base tier
+    maker_fee_rate: float = 0.00015          # 0.015% base tier
+    liquidation_penalty_rate: float = 0.005  # Simplified; real HL uses staged liquidation
 
     # Tracking
     trade_log: list = field(default_factory=list)
@@ -182,11 +197,46 @@ class HyperliquidAccount:
         """Current position notional value."""
         return self.position_size_eth * self.entry_price
 
+    def maintenance_margin_required(self, current_price: float):
+        """
+        Maintenance margin requirement at current mark price.
+
+        maintenance_margin = notional × maintenance_margin_rate
+
+        In reality this follows Hyperliquid's tiered schedule (larger
+        positions require proportionally more margin). We use a single
+        rate as a simplification for positions within one tier.
+        """
+        notional = self.position_size_eth * current_price
+        return notional * self.maintenance_margin_rate
+
+    def health_factor(self, current_price: float):
+        """
+        Hyperliquid health factor (analogous to Aave HF).
+
+            HF = account_equity / maintenance_margin_requirement
+
+        Interpretation:
+            HF > 1.0  → position is healthy
+            HF = 1.0  → at liquidation boundary
+            HF < 1.0  → liquidation triggered
+
+        This is equivalent to margin_ratio / maintenance_margin_rate,
+        but framing it as a health factor makes risk directly comparable
+        with the Aave side of the strategy.
+        """
+        self.mark_to_market(current_price)
+        mm_req = self.maintenance_margin_required(current_price)
+        if mm_req <= 0:
+            return float('inf')
+        return self.equity / mm_req
+
     def margin_ratio(self, current_price: float):
         """
         Current margin ratio = equity / position_notional.
 
-        Liquidation when margin_ratio < maintenance_margin_rate.
+        Convenience method. Relationship to health factor:
+            margin_ratio = HF × maintenance_margin_rate
         """
         self.mark_to_market(current_price)
         notional = self.position_size_eth * current_price
@@ -198,14 +248,21 @@ class HyperliquidAccount:
         """
         Check if position should be liquidated.
 
+        Uses health_factor < 1.0 as the trigger (equivalent to
+        margin_ratio < maintenance_margin_rate).
+
+        Simplification: models liquidation as a single terminal event.
+        Real Hyperliquid uses staged liquidation (20% partial for >$100k
+        notional, backstop at equity < 2/3 maintenance).
+
         Returns:
             (is_liquidated, loss_amount)
         """
         if self.position_size_eth <= 0:
             return False, 0.0
 
-        mr = self.margin_ratio(current_price)
-        if mr < self.maintenance_margin_rate:
+        hf = self.health_factor(current_price)
+        if hf < 1.0:
             # Liquidation occurs
             notional = self.position_size_eth * current_price
             penalty = notional * self.liquidation_penalty_rate
@@ -237,6 +294,7 @@ class HyperliquidAccount:
             'entry_price': self.entry_price,
             'unrealized_pnl': self.unrealized_pnl,
             'equity': self.equity,
+            'health_factor': self.health_factor(current_price),
             'margin_ratio': self.margin_ratio(current_price),
             'cumulative_funding': self.cumulative_funding,
             'cumulative_fees': self.cumulative_fees,
@@ -256,12 +314,15 @@ class AavePosition:
     Strategy: Supply WETH as collateral, borrow USDC.
     The borrowed USDC funds the Hyperliquid margin account.
 
-    Aave v3 parameters for WETH on Arbitrum (as of 2024):
-    - Max LTV: 80% (can borrow up to 80% of collateral value)
-    - Liquidation threshold: 82.5%
+    Aave v3 parameters for WETH on Arbitrum:
+    - Max LTV: 82.5%
+    - Liquidation threshold: 85.0%
     - Liquidation penalty: 5%
     - Supply APY: variable (typically 1-3%)
     - E-Mode (ETH correlated): LTV 90%, liq threshold 93%
+
+    Source: Aave governance risk-parameter alignment proposal
+    https://governance.aave.com/t/arfc-chaos-labs-risk-parameter-updates-ltv-and-lt-alignment/18997
 
     For USDC borrowing:
     - Variable borrow rate: depends on utilization
@@ -278,9 +339,9 @@ class AavePosition:
     cumulative_interest_paid: float = 0.0
     cumulative_supply_earned: float = 0.0
 
-    # Protocol parameters
-    max_ltv: float = 0.80                # 80% LTV
-    liquidation_threshold: float = 0.825  # 82.5%
+    # Protocol parameters (WETH on Aave V3 Arbitrum)
+    max_ltv: float = 0.825               # 82.5% LTV
+    liquidation_threshold: float = 0.85   # 85.0%
     liquidation_penalty: float = 0.05     # 5% penalty
     e_mode: bool = False                  # E-Mode disabled by default
 
@@ -490,20 +551,29 @@ class DeltaNeutralSimulator:
     """
 
     def __init__(self, capital: float, leverage: float = 1.0,
-                 rebalance_threshold: float = 0.05,
                  mode: str = "leveraged",
-                 e_mode: bool = False):
+                 e_mode: bool = False,
+                 hl_margin_threshold: float = 0.08,
+                 hl_margin_target: float = 0.15,
+                 aave_hf_threshold: float = 1.15,
+                 aave_hf_target: float = 1.30):
         """
         Args:
             capital: Starting capital in USDC
             leverage: Target leverage (1.0 = no leverage, 2.0 = 2x, etc.)
-            rebalance_threshold: Rebalance when delta drifts by this fraction
             mode: "simple" or "leveraged"
             e_mode: Use Aave E-Mode (higher LTV)
+            hl_margin_threshold: Rebalance HL when margin ratio drops below this
+            hl_margin_target: Target HL margin ratio after rebalance
+            aave_hf_threshold: Rebalance Aave if health factor drops below this
+            aave_hf_target: Target Aave HF after repayment/reduction
         """
         self.initial_capital = capital
         self.target_leverage = leverage
-        self.rebalance_threshold = rebalance_threshold
+        self.hl_margin_threshold = hl_margin_threshold
+        self.hl_margin_target = hl_margin_target
+        self.aave_hf_threshold = aave_hf_threshold
+        self.aave_hf_target = aave_hf_target
         self.mode = mode
 
         # Initialize accounts
@@ -522,50 +592,20 @@ class DeltaNeutralSimulator:
         """
         Open the initial delta-neutral position.
 
-        For "leveraged" mode with leverage L:
-        - Total notional exposure = L * capital
-        - Each side (spot + perp) = L * capital / 2 ... NO
+        Capital C is split into two buckets:
+            perp_margin (α × C)  → USDC deposited on Hyperliquid
+            aave_capital ((1-α) × C) → buys ETH, supplied to Aave, looped
 
-        Actually, the strategy works like this:
+        After Aave looping at LTV ratio r:
+            total_spot_value = aave_capital / (1 - r)
+            aave_debt = aave_capital × r / (1 - r)
 
-        With capital C and leverage L:
-        - Total position size = C * L (in USD terms)
-        - Buy C * L / price ETH spot
-        - Short C * L / price ETH perp
+        Short perp notional = total_spot_value (delta neutral).
 
-        For leveraged mode:
-        - Supply enough ETH to Aave to borrow what we need
-        - Use borrowed USDC + own USDC for margin
+        Effective leverage on total capital:
+            L_eff = total_spot_value / C = (1 - α) / (1 - r)
 
-        Simple approach:
-        - Split capital: some for spot ETH, some for perp margin
-        - With leverage L:
-          * Notional = C * L
-          * Need enough margin on both sides
-
-        Realistic approach for L=2x:
-        - Have $100k USDC
-        - Supply $50k worth of ETH to Aave (buy first)
-        - Borrow $40k USDC from Aave (80% LTV)
-        - Now have $90k USDC ($50k remaining + $40k borrowed)
-        - Deposit $90k USDC as Hyperliquid margin
-        - Short $100k notional ETH perp
-        - Net exposure: +$50k spot, -$100k perp... not delta neutral
-
-        Better approach:
-        - Goal: L× leverage means L× the funding capture per dollar of capital
-        - With $100k capital at 2× leverage:
-          * Want $200k notional short perp → earns 2× funding
-          * Need enough margin for $200k short
-          * On Hyperliquid: need ~$200k/20 = $10k initial margin (20× max)
-            But want conservative margin, say 10% = $20k
-          * Also need $200k ETH spot hedge
-
-        Simplest correct model:
-        - Capital C split into spot_allocation and perp_margin
-        - spot_allocation buys ETH
-        - With Aave: supply ETH, borrow USDC, add to perp_margin
-        - Short perp = spot_eth_value to be delta neutral
+        Without Aave (simple mode): r = 0, so L_eff = 1 - α < 1.
         """
         if self.mode == "simple":
             self._init_simple(eth_price)
@@ -576,250 +616,146 @@ class DeltaNeutralSimulator:
 
     def _init_simple(self, eth_price: float):
         """
-        Simple mode: no Aave leverage.
-        Split capital 50/50 between spot and perp margin.
-        Short perp = spot value → delta neutral.
+        Simple mode: no Aave, no looping.
+
+        Capital C split into spot_budget and perp_margin.
+        Effective leverage = spot_budget / C = 1 - α (always < 1).
+
+        The 'leverage' parameter here controls the split:
+            α = 1 - leverage  (e.g., leverage=0.5 → 50/50 split)
+
+        Since there's no Aave, leverage > 1.0 is impossible.
+        We clamp leverage to (0, 1) and interpret it as the
+        fraction of capital that goes to spot.
         """
-        spot_alloc = self.cash_usdc / 2
-        margin_alloc = self.cash_usdc / 2
+        C = self.cash_usdc
+        P = eth_price
+
+        # Clamp: without Aave, max effective leverage < 1.0
+        L = min(self.target_leverage, 0.95)  # Leave at least 5% for margin
+        if self.target_leverage >= 1.0:
+            print(f"  Warning: Simple mode cannot achieve {self.target_leverage}× leverage.")
+            print(f"  Clamped to {L:.2f}× (use 'leveraged' mode for ≥1×)")
+
+        # α = fraction for perp margin
+        alpha = 1 - L  # e.g., L=0.5 → α=0.5 (50/50)
+
+        spot_budget = (1 - alpha) * C   # = L × C
+        perp_margin = alpha * C         # = (1-L) × C
 
         # Buy spot ETH
-        eth_amount = spot_alloc / eth_price
+        eth_amount = spot_budget / P
         self.spot_eth = eth_amount
-        self.spot_entry_price = eth_price
+        self.spot_entry_price = P
 
-        # Deposit margin and short perp
-        self.hl_account.deposit_margin(margin_alloc)
-        self.hl_account.open_short(eth_amount, eth_price)
+        # Deposit margin and short same ETH amount → delta neutral
+        self.hl_account.deposit_margin(perp_margin)
+        self.hl_account.open_short(eth_amount, P)
 
         self.cash_usdc = 0
 
     def _init_leveraged(self, eth_price: float):
         """
-        Leveraged mode using Aave:
+        Leveraged mode using Aave looping.
 
-        With capital C and target leverage L:
-        1. Buy (C / eth_price) ETH with all capital
-        2. Supply all ETH to Aave
-        3. Borrow USDC from Aave (up to LTV limit based on leverage)
-        4. Deposit borrowed USDC as Hyperliquid margin
-        5. Short (C * L / eth_price) ETH perp
+        Given capital C and target effective leverage L:
 
-        The position:
-        - Long: C worth of ETH in Aave (earning supply APY)
-        - Short: C * L notional ETH perp (earning funding × L)
-        - Debt: borrowed USDC on Aave
+        1. Split C into perp_margin (α×C) and aave_capital ((1-α)×C)
+        2. Buy aave_capital / P ETH
+        3. Supply to Aave → borrow at LTV r → buy more ETH → loop
+        4. After looping:
+              total_spot_value = aave_capital / (1-r)
+              aave_debt = aave_capital × r / (1-r)
+        5. Short total_spot_value / P ETH perp (delta neutral)
 
-        Delta:
-        - Spot delta: + C (from Aave collateral)
-        - Perp delta: - C * L
-        - Net delta: C * (1 - L)
+        Effective leverage: L_eff = (1-α) / (1-r)
 
-        Wait — for delta neutral, we need spot = perp:
-        - If L=1: spot C, short C → delta neutral ✓
-        - If L=2: spot C, short 2C → net short C ✗
+        Constraints:
+        - Aave HF = liq_threshold / r ≥ target_hf
+          → r ≤ liq_threshold / target_hf
+        - r < max_ltv (Aave LTV cap)
+        - perp_margin > 0
 
-        For true delta neutral at higher leverage, we need MORE spot:
-        - Supply C worth ETH → borrow 0.8C USDC → buy more ETH → supply → borrow...
+        Solving for α given L and target Aave HF:
+        - r = liq_threshold / target_hf  (use max allowed r from HF)
+        - α = 1 - L × (1-r)
 
-        Recursive leverage (looping):
-        - Round 0: Have C USDC. Buy C/P ETH, supply to Aave.
-        - Round 1: Borrow C×LTV USDC. Buy more ETH, supply to Aave.
-        - Round 2: Borrow C×LTV² USDC. Buy more ETH...
-        - Total ETH value = C × (1 + LTV + LTV² + ...) = C / (1 - LTV)
-
-        With LTV=0.8: max leverage = 1/(1-0.8) = 5×
-        With E-mode LTV=0.9: max leverage = 1/(1-0.9) = 10×
-
-        For target leverage L:
-        - Need total ETH value = C × L
-        - Total debt = C × L - C = C × (L - 1)
-        - LTV used = debt / collateral = (L-1) / L
-        - Must have (L-1)/L < max_LTV → L < 1/(1-max_LTV)
-
-        For L=2, LTV used = 0.5 (safe, below 0.8)
-        For L=3, LTV used = 0.667 (safe, below 0.8)
-        For L=4, LTV used = 0.75 (safe, below 0.8)
-        For L=5, LTV used = 0.80 (at limit)
+        If α < 0: not enough capital for this leverage (need r > max_r).
+        If α ≥ 1: leverage ≤ 0 (nonsensical).
         """
         C = self.cash_usdc
         L = self.target_leverage
         P = eth_price
 
-        # Check leverage is feasible
+        liq_threshold = self.aave.effective_liq_threshold
         max_ltv = self.aave.effective_ltv
-        required_ltv = (L - 1) / L if L > 1 else 0
-        if required_ltv >= max_ltv:
-            raise ValueError(
-                f"Leverage {L}× requires LTV {required_ltv:.2%}, "
-                f"but max LTV is {max_ltv:.0%}. "
-                f"Max leverage: {1/(1-max_ltv):.1f}×"
-            )
 
-        # Total ETH to buy = C * L / P
-        total_eth = C * L / P
-        total_eth_value = C * L  # = total_eth * P
+        # Target starting Aave HF (minimum acceptable)
+        target_aave_hf = 1.2
 
-        # Buy all ETH (this represents the looped leverage result)
-        # In reality this happens via multiple loops, but the end state is the same
+        # Max LTV from HF constraint: r ≤ liq_threshold / target_hf
+        max_r_from_hf = liq_threshold / target_aave_hf
+
+        # Also must respect Aave's hard LTV cap
+        max_r = min(max_r_from_hf, max_ltv)
+
+        if L <= 1.0:
+            # No Aave needed for L ≤ 1, but user chose leveraged mode
+            # Just use a small r (or 0) to keep it simple
+            r = 0.0
+            alpha = 1 - L  # Same as simple mode
+            if alpha < 0.05:
+                alpha = 0.05  # Keep minimum margin
+        else:
+            # Use the max allowed r (tightest Aave HF we accept at start)
+            r = max_r
+
+            # α = 1 - L × (1-r)
+            alpha = 1 - L * (1 - r)
+
+            if alpha < 0.02:
+                # Not enough capital for perp margin at this leverage
+                # Reduce leverage to what's achievable
+                alpha = 0.02  # Keep 2% minimum for margin
+                L = (1 - alpha) / (1 - r)
+                print(f"  Warning: Adjusted to {L:.2f}× leverage "
+                      f"(insufficient margin for target)")
+
+            if alpha >= 1.0:
+                raise ValueError(
+                    f"Cannot achieve {L}× leverage. "
+                    f"Max with HF≥{target_aave_hf}: "
+                    f"{(1-0.02)/(1-max_r):.1f}×"
+                )
+
+        # Compute final position sizes
+        perp_margin = alpha * C
+        aave_capital = (1 - alpha) * C
+
+        if r > 0:
+            total_spot_value = aave_capital / (1 - r)
+            aave_debt = total_spot_value - aave_capital
+        else:
+            total_spot_value = aave_capital
+            aave_debt = 0
+
+        total_eth = total_spot_value / P
+        effective_leverage = total_spot_value / C
+
+        # Execute: supply ETH to Aave
         self.spot_eth = total_eth
         self.spot_entry_price = P
-
-        # Supply all ETH to Aave
         self.aave.supply_eth(total_eth, P)
 
-        # Borrow USDC: debt = C * (L - 1)
-        debt_needed = C * (L - 1)
-        if debt_needed > 0:
-            self.aave.borrow_usdc(debt_needed, P)
+        # Borrow from Aave
+        if aave_debt > 0:
+            self.aave.borrow_usdc(aave_debt, P)
 
-        # Deposit borrowed USDC + remaining capital as perp margin
-        # After buying C*L worth of ETH with C cash, we're out of cash
-        # But the borrowed USDC from Aave gives us margin
-        perp_margin = debt_needed + C * 0  # All capital went to ETH
-        # Actually: we spent C buying ETH, then borrowed debt_needed USDC
-        # The borrowed USDC is what we use as perp margin
-
-        # Wait, let's think again:
-        # We start with C USDC
-        # We buy C*L/P ETH. But we only have C USDC!
-        # The loop works like this:
-        # 1. Buy C/P ETH with C USDC → 0 USDC left
-        # 2. Supply C/P ETH to Aave
-        # 3. Borrow C*LTV USDC from Aave
-        # 4. Buy (C*LTV)/P ETH
-        # 5. Supply to Aave
-        # 6. Borrow C*LTV² USDC...
-        # After all loops: total ETH = C*L/P, total debt = C*(L-1)
-        # Final borrowed amount available = C * LTV^n (last loop residual)
-        # But ALL borrowed USDC went to buying ETH!
-
-        # So where does perp margin come from?
-        # Answer: part of the capital is reserved for margin, not all goes to ETH
-
-        # Correct approach:
-        # - Reserve some capital for perp margin
-        # - Use rest for the Aave loop
-        #
-        # Let M = margin needed for Hyperliquid short of C*L notional
-        # Hyperliquid allows up to 50× leverage, so min margin = C*L/50
-        # But for safety, we want margin_ratio ≈ 10-20%
-        #
-        # Better model: user's total capital C is deployed as follows:
-        # - perp_margin = enough for the short position
-        # - spot_capital = C - perp_margin → leveraged via Aave
-        # - Total spot ETH = spot_capital * L_aave
-        # - Short perp notional = spot ETH value (delta neutral)
-        # - perp_margin must support this short
-        #
-        # For simplicity and realism:
-        # Split: fraction α goes to perp margin, (1-α) goes to Aave loop
-        # Aave leverage on spot: L_aave = 1/(1 - used_LTV)
-        # Total spot = (1-α) × C × L_aave
-        # Perp short = total spot (delta neutral)
-        # Need: α × C sufficient margin for perp short of total_spot
-        # Hyperliquid initial margin ~5% for 20× max leverage
-        # So α × C ≥ 0.05 × total_spot
-        # α ≥ 0.05 × (1-α) × L_aave
-        # α ≥ 0.05 × L_aave - 0.05 × α × L_aave
-        # α(1 + 0.05 × L_aave) ≥ 0.05 × L_aave
-        # α ≥ 0.05 × L_aave / (1 + 0.05 × L_aave)
-
-        # Let's use a cleaner model with explicit margin fraction
-        # Reset everything and redo
-        self.aave = AavePosition(e_mode=self.aave.e_mode)
-        self.hl_account = HyperliquidAccount()
-
-        # Target: short C*L notional on perp, hold C*L notional in spot ETH
-        # This means we earn L× the funding rate on our capital
-        #
-        # Capital allocation for leverage L:
-        #   α × C → perp margin on Hyperliquid
-        #   (1-α) × C → buy ETH, supply to Aave, borrow loop
-        #
-        # After Aave looping at LTV ratio r:
-        #   Total ETH value = (1-α) × C / (1-r)
-        #   Total debt = (1-α) × C × r / (1-r)
-        #   Aave HF = (total_ETH_value × liq_threshold) / debt
-        #          = liq_threshold / r
-        #
-        # For delta neutral: perp short notional = total ETH value
-        # Effective leverage: L_eff = (1-α) / (1-r)
-        #
-        # Solve for r given target L and α:
-        #   r = 1 - (1-α)/L
-        #
-        # We choose α to keep perp margin ratio ≥ 10% of notional
-        # and keep Aave HF ≥ 1.5 (safe)
-        #
-        # HF constraint: liq_threshold / r ≥ 1.5
-        #   → r ≤ liq_threshold / 1.5 = 0.825/1.5 = 0.55
-        #
-        # For L=2: r = 1 - (1-α)/2
-        #   HF ≥ 1.5 → r ≤ 0.55 → 1-(1-α)/2 ≤ 0.55 → (1-α) ≥ 0.9 → α ≤ 0.1
-        #   So with α=0.10: r = 1 - 0.9/2 = 0.55, HF = 0.825/0.55 = 1.50 ✓
-        #   Perp margin = 0.10 × C, notional = 0.9C/0.45 = 2C
-        #   Margin ratio = 0.1C / 2C = 5% (tight but Hyperliquid allows it)
-
-        liq_threshold = self.aave.effective_liq_threshold
-        target_hf = 1.2  # Minimum starting health factor (1.1 too low, 1.2+ ok)
-
-        # Max LTV from HF constraint
-        max_r = liq_threshold / target_hf  # 0.825/1.5 = 0.55
-
-        # Solve for α: r = 1 - (1-α)/L ≤ max_r → α ≤ 1 - L*(1-max_r)
-        alpha_max_from_hf = 1 - L * (1 - max_r)
-
-        # Perp margin constraint: α×C ≥ 0.05 × notional = 0.05 × (1-α)×C/(1-r)
-        # We'll set a minimum α from perp margin ratio
-        min_margin_ratio = 0.05  # 5% of notional minimum (20× max perp leverage)
-        # α ≥ min_margin_ratio × L (since notional = L×C)
-        alpha_min_from_margin = min_margin_ratio * L
-
-        # Choose α
-        if L <= 1.0:
-            alpha = 0.5  # Simple 50/50 split for no leverage
-        else:
-            alpha = max(alpha_min_from_margin, min(alpha_max_from_hf, 0.5))
-
-        # If alpha is too high, we can't achieve target leverage
-        if alpha >= 1.0:
-            raise ValueError(
-                f"Cannot achieve {L}× leverage safely. "
-                f"Max leverage with HF≥{target_hf}: "
-                f"{1/(1-max_r) * (1-alpha_min_from_margin):.1f}×"
-            )
-
-        perp_margin = alpha * C
-        spot_capital = (1 - alpha) * C
-
-        # Aave LTV needed
-        r = 1 - spot_capital / (C * L) if L > 1 else 0
-        r = max(0, r)
-
-        if r >= max_ltv:
-            # Can't achieve full leverage, reduce
-            r = max_ltv * 0.95
-            actual_notional = spot_capital / (1 - r)
-            L = actual_notional / C
-            print(f"  Warning: Adjusted to {L:.2f}× leverage (Aave LTV limit)")
-
-        target_notional = C * L
-        target_eth = target_notional / P
-
-        # Execute: supply ETH, borrow USDC
-        self.spot_eth = target_eth
-        self.aave.supply_eth(target_eth, P)
-
-        debt = target_notional - spot_capital
-        if debt > 0:
-            self.aave.borrow_usdc(debt, P)
-
-        # Deposit margin and open short
+        # Deposit margin and short perp (same ETH quantity → delta neutral)
         self.hl_account.deposit_margin(perp_margin)
-        self.hl_account.open_short(target_eth, P)
+        self.hl_account.open_short(total_eth, P)
 
-        self.cash_usdc = 0  # All capital deployed
+        self.cash_usdc = 0
 
     def step(self, timestamp, eth_price: float, funding_rate: float,
              borrow_apy: float = 0.05, supply_apy: float = 0.02,
@@ -900,29 +836,27 @@ class DeltaNeutralSimulator:
         Since both are in ETH terms and we hold same quantity,
         the delta is naturally hedged in ETH terms.
 
-        BUT: the margin ratio on Hyperliquid changes:
-        - If ETH goes up: short loses money, margin_ratio drops
-        - If ETH goes down: short gains, margin_ratio increases
+        BUT: the risk metrics change with price:
+        - If ETH goes up: short loses money, HL margin ratio drops, Aave HF rises
+        - If ETH goes down: short gains, HL margin ratio rises, Aave HF drops
 
-        We rebalance when margin_ratio gets too low (risky)
-        or when the Aave health factor gets too low.
+        We rebalance when HL margin ratio or Aave health factor gets too low.
         """
         rebalanced = False
 
-        # Check perp margin ratio
+        # Check Hyperliquid margin ratio
         if self.hl_account.position_size_eth > 0:
-            mr = self.hl_account.margin_ratio(eth_price)
+            hl_margin_ratio = self.hl_account.margin_ratio(eth_price)
 
-            # Rebalance if margin ratio drops below threshold
-            if mr < self.rebalance_threshold:
+            if hl_margin_ratio < self.hl_margin_threshold:
                 self._rebalance_perp_margin(eth_price)
                 rebalanced = True
 
         # Check Aave health factor
         if self.mode == "leveraged" and self.aave.debt_usdc > 0:
-            hf = self.aave.health_factor(eth_price)
-            # Rebalance if health factor too low
-            if hf < 1.2:  # 1.2 = safety buffer above 1.0 liquidation
+            aave_hf = self.aave.health_factor(eth_price)
+
+            if aave_hf < self.aave_hf_threshold:
                 self._rebalance_aave(eth_price)
                 rebalanced = True
 
@@ -939,9 +873,8 @@ class DeltaNeutralSimulator:
         - In leveraged mode: borrow more from Aave (if possible)
         - In simple mode: reduce spot position
         """
-        target_mr = 0.15  # Target 15% margin ratio after rebalance
         current_notional = self.hl_account.position_size_eth * eth_price
-        needed_equity = target_mr * current_notional
+        needed_equity = self.hl_margin_target * current_notional
         current_equity = self.hl_account.equity
         top_up = needed_equity - current_equity
 
@@ -975,7 +908,7 @@ class DeltaNeutralSimulator:
 
         We repay debt using PnL from perp margin account.
         """
-        target_hf = 1.5
+        target_hf = self.aave_hf_target
         # debt_target = collateral * liq_threshold / target_hf
         debt_target = (
             self.aave.collateral_eth * eth_price
@@ -986,10 +919,11 @@ class DeltaNeutralSimulator:
         if repay_amount <= 0:
             return
 
-        # Source from Hyperliquid margin (withdraw excess margin)
-        excess_margin = self.hl_account.equity - (
-            self.hl_account.position_size_eth * eth_price * 0.10  # Keep 10% margin
-        )
+        # Source from Hyperliquid margin.
+        # Keep enough equity to stay at or above the configured HL margin buffer.
+        hl_notional = self.hl_account.position_size_eth * eth_price
+        min_hl_equity = self.hl_margin_threshold * hl_notional
+        excess_margin = self.hl_account.equity - min_hl_equity
         usdc_available = max(0, excess_margin)
         repay = min(repay_amount, usdc_available)
 
@@ -999,15 +933,15 @@ class DeltaNeutralSimulator:
 
         # If still not enough, repay debt first then withdraw collateral
         new_hf = self.aave.health_factor(eth_price)
-        if new_hf < 1.2 and self.aave.debt_usdc > 0:
+        if new_hf < self.aave_hf_threshold and self.aave.debt_usdc > 0:
             # Close 20% of perp short to free up USDC
             reduce_eth = self.hl_account.position_size_eth * 0.2
             pnl = self.hl_account.close_short(reduce_eth, eth_price)
 
             # Use freed margin to repay Aave debt first
-            freed_margin = max(0, self.hl_account.equity - (
-                self.hl_account.position_size_eth * eth_price * 0.10
-            ))
+            remaining_notional = self.hl_account.position_size_eth * eth_price
+            min_hl_eq = self.hl_margin_threshold * remaining_notional
+            freed_margin = max(0, self.hl_account.equity - min_hl_eq)
             repay_more = min(freed_margin, self.aave.debt_usdc)
             if repay_more > 0:
                 self.hl_account.margin_deposited -= repay_more
@@ -1045,6 +979,7 @@ class DeltaNeutralSimulator:
             'spot_eth': self.spot_eth,
             'spot_value': spot_value,
             'hl_equity': hl_equity,
+            'hl_health_factor': self.hl_account.health_factor(eth_price),
             'hl_margin_ratio': self.hl_account.margin_ratio(eth_price),
             'hl_unrealized_pnl': self.hl_account.unrealized_pnl,
             'hl_cumulative_funding': self.hl_account.cumulative_funding,
@@ -1096,6 +1031,7 @@ class DeltaNeutralSimulator:
             'total_aave_supply_yield': self.aave.cumulative_supply_earned,
             'rebalance_count': self.rebalance_count,
             'max_drawdown_pct': self._max_drawdown(df),
+            'min_hl_health_factor': df['hl_health_factor'].min(),
             'min_hl_margin_ratio': df['hl_margin_ratio'].min(),
             'min_aave_hf': df['aave_health_factor'].min() if self.mode == "leveraged" else None,
             'hl_liquidated': final['hl_liquidated'],
@@ -1117,9 +1053,12 @@ class DeltaNeutralSimulator:
 def run_simulation(price_data: pd.DataFrame,
                    capital: float = 100_000,
                    leverage: float = 2.0,
-                   rebalance_threshold: float = 0.05,
                    mode: str = "leveraged",
                    e_mode: bool = False,
+                   hl_margin_threshold: float = 0.08,
+                   hl_margin_target: float = 0.15,
+                   aave_hf_threshold: float = 1.15,
+                   aave_hf_target: float = 1.30,
                    verbose: bool = True):
     """
     Run a complete simulation from a price/funding DataFrame.
@@ -1133,9 +1072,12 @@ def run_simulation(price_data: pd.DataFrame,
             - supply_apy: (optional) Aave WETH supply APY
         capital: Starting capital in USDC
         leverage: Target leverage
-        rebalance_threshold: Margin ratio threshold for rebalancing
         mode: "simple" or "leveraged"
         e_mode: Use Aave E-Mode
+        hl_margin_threshold: Rebalance HL when margin ratio drops below this
+        hl_margin_target: Target HL margin ratio after rebalance
+        aave_hf_threshold: Rebalance Aave if health factor drops below this
+        aave_hf_target: Target Aave HF after repayment/reduction
         verbose: Print progress
 
     Returns:
@@ -1144,9 +1086,12 @@ def run_simulation(price_data: pd.DataFrame,
     sim = DeltaNeutralSimulator(
         capital=capital,
         leverage=leverage,
-        rebalance_threshold=rebalance_threshold,
         mode=mode,
         e_mode=e_mode,
+        hl_margin_threshold=hl_margin_threshold,
+        hl_margin_target=hl_margin_target,
+        aave_hf_threshold=aave_hf_threshold,
+        aave_hf_target=aave_hf_target,
     )
 
     # Initialize position at first price
@@ -1160,12 +1105,19 @@ def run_simulation(price_data: pd.DataFrame,
     sim.initialize_position(first_price)
 
     if verbose:
-        print(f"  Spot ETH: {sim.spot_eth:.4f} (${sim.spot_eth * first_price:,.0f})")
+        notional = sim.spot_eth * first_price
+        eff_lev = notional / capital
+        print(f"  Spot ETH: {sim.spot_eth:.4f} (${notional:,.0f})")
         print(f"  Short perp: {sim.hl_account.position_size_eth:.4f} ETH")
-        print(f"  HL margin: ${sim.hl_account.margin_deposited:,.0f}")
-        if mode == "leveraged":
-            print(f"  Aave collateral: {sim.aave.collateral_eth:.4f} ETH")
-            print(f"  Aave debt: ${sim.aave.debt_usdc:,.0f}")
+        print(f"  Effective leverage: {eff_lev:.2f}×")
+        print(f"  HL margin: ${sim.hl_account.margin_deposited:,.0f} "
+              f"(margin ratio: {sim.hl_account.margin_ratio(first_price):.1%})")
+        print(f"  HL HF: {sim.hl_account.health_factor(first_price):.2f}")
+        if mode == "leveraged" and sim.aave.debt_usdc > 0:
+            print(f"  Aave collateral: {sim.aave.collateral_eth:.4f} ETH "
+                  f"(${sim.aave.collateral_eth * first_price:,.0f})")
+            print(f"  Aave debt: ${sim.aave.debt_usdc:,.0f} "
+                  f"(LTV: {sim.aave.current_ltv(first_price):.1%})")
             print(f"  Aave HF: {sim.aave.health_factor(first_price):.2f}")
         print()
 
@@ -1209,6 +1161,9 @@ def run_simulation(price_data: pd.DataFrame,
             print(f"  Aave supply yield: ${summary['total_aave_supply_yield']:,.0f}")
         print(f"  Rebalances: {summary['rebalance_count']}")
         print(f"  Max drawdown: {summary['max_drawdown_pct']:.2f}%")
+        print(f"  Min HL HF: {summary['min_hl_health_factor']:.2f}")
+        if mode == "leveraged" and summary['min_aave_hf'] is not None:
+            print(f"  Min Aave HF: {summary['min_aave_hf']:.2f}")
         if summary['hl_liquidated'] or summary['aave_liquidated']:
             print(f"  *** LIQUIDATION OCCURRED ***")
 
@@ -1308,6 +1263,7 @@ def compare_leverage_levels(price_data: pd.DataFrame,
     display_cols = [
         'leverage_input', 'total_return_pct', 'annualized_return_pct',
         'total_funding_received', 'max_drawdown_pct',
+        'min_hl_health_factor', 'min_aave_hf',
         'rebalance_count', 'hl_liquidated', 'aave_liquidated'
     ]
     available = [c for c in display_cols if c in comparison.columns]
@@ -1389,5 +1345,5 @@ if __name__ == '__main__':
 
     # Access detailed results
     print(results[['timestamp', 'eth_price', 'total_equity', 'pnl_pct',
-                    'hl_margin_ratio', 'aave_health_factor']].tail())
+                    'hl_health_factor', 'aave_health_factor']].tail())
     """)

@@ -44,3 +44,5 @@ reports/
 path/to/file
 
 .claude
+# S3 data downloads
+simulation/data/

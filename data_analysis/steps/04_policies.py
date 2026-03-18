@@ -122,9 +122,12 @@ class AdaptiveLeverageGovernor:
         # Cache model params for fast inner loop
         self.c_reb = cost_model.params['c_reb']
         self.beta = cost_model.params['beta']
-        self.alpha_spot = cost_model.params['alpha_spot']
         self.alpha_perp = cost_model.params['alpha_perp']
-        self.phi = cost_model.params['phi_spot'] + cost_model.params['phi_perp']
+        self.phi_perp = cost_model.params['phi_perp']
+        # Empirical spot impact params
+        self.spot_impact_a = cost_model.params['spot_impact_a']
+        self.spot_impact_b = cost_model.params['spot_impact_b']
+        self.phi_spot = cost_model.params['phi_spot']
         self.c_fixed = cost_model.params['c_fixed']
         self.rate_curve = cost_model.params['rate_curve']
 
@@ -172,12 +175,15 @@ class AdaptiveLeverageGovernor:
             trade = eps * (Q / 2)
 
             # Cost per rebalance / Q  (=K)
-            spot_frac = (trade / D_spot) ** self.beta
+            # Spot: empirical Uniswap model (fee included)
+            spot_slip_bps = (self.phi_spot * 10000
+                             + self.spot_impact_a * trade ** self.spot_impact_b)
+            spot_cost_per_Q = (spot_slip_bps / 10000) * trade / Q
+            # Perp: Gatheral model + perp fee
             perp_frac = (trade / D_perp) ** self.beta
-            K = (self.phi * eps / 2
-                 + self.alpha_spot * (eps / 2) * spot_frac
-                 + self.alpha_perp * (eps / 2) * perp_frac
-                 + self.c_fixed / Q)
+            perp_cost_per_Q = (self.phi_perp * eps / 2
+                               + self.alpha_perp * (eps / 2) * perp_frac)
+            K = spot_cost_per_Q + perp_cost_per_Q + self.c_fixed / Q
 
             # Analytical L* from first-order condition: d(r_net)/dL = 0
             if marginal_carry > 0 and sigma_e_sq > 0 and K > 0:
@@ -260,12 +266,14 @@ class SmoothedAdaptiveLeverageGovernor(AdaptiveLeverageGovernor):
 
         for eps in self.epsilon_grid:
             trade = eps * (Q / 2)
-            spot_frac = (trade / D_spot) ** self.beta
+            # K: same empirical spot + Gatheral perp as base ALG
+            spot_slip_bps = (self.phi_spot * 10000
+                             + self.spot_impact_a * trade ** self.spot_impact_b)
+            spot_cost_per_Q = (spot_slip_bps / 10000) * trade / Q
             perp_frac = (trade / D_perp) ** self.beta
-            K = (self.phi * eps / 2
-                 + self.alpha_spot * (eps / 2) * spot_frac
-                 + self.alpha_perp * (eps / 2) * perp_frac
-                 + self.c_fixed / Q)
+            perp_cost_per_Q = (self.phi_perp * eps / 2
+                               + self.alpha_perp * (eps / 2) * perp_frac)
+            K = spot_cost_per_Q + perp_cost_per_Q + self.c_fixed / Q
 
             if marginal_carry > 0 and sigma_e_sq > 0 and K > 0:
                 L_star = (marginal_carry * eps ** 2) / (2 * self.c_reb * sigma_e_sq * K)
@@ -285,12 +293,15 @@ class SmoothedAdaptiveLeverageGovernor(AdaptiveLeverageGovernor):
             delta_L = abs(L - self._prev_L)
             if delta_L > 0:
                 trade_transition = delta_L * (Q / 2)
-                tc = (self.phi * delta_L / 2
-                      + self.alpha_spot * (delta_L / 2)
-                        * (trade_transition / D_spot) ** self.beta
-                      + self.alpha_perp * (delta_L / 2)
-                        * (trade_transition / D_perp) ** self.beta)
-                r_net -= tc
+                # Spot: empirical model on transition trade
+                tc_spot_bps = (self.phi_spot * 10000
+                               + self.spot_impact_a * trade_transition ** self.spot_impact_b)
+                tc_spot = (tc_spot_bps / 10000) * trade_transition / Q
+                # Perp: Gatheral
+                tc_perp = (self.phi_perp * delta_L / 2
+                           + self.alpha_perp * (delta_L / 2)
+                             * (trade_transition / D_perp) ** self.beta)
+                r_net -= (tc_spot + tc_perp)
 
             if r_net > best_rnet:
                 best_rnet = r_net

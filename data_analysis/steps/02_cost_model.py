@@ -26,30 +26,53 @@ class VaultCostModel:
     def __init__(self, params):
         """
         Initialize cost model with parameters.
-        
+
         Args:
             params: Dict with model parameters
-                - phi_spot: Spot trading fee rate (e.g., 0.0004)
-                - phi_perp: Perp trading fee rate (e.g., 0.0004)
-                - alpha_spot: Spot impact scale (e.g., 0.001)
-                - alpha_perp: Perp impact scale (e.g., 0.0008)
-                - beta: Impact convexity (e.g., 1.3)
-                - c_reb: Rebalancing frequency constant (e.g., 0.0008)
-                - c_fixed: Fixed cost per rebalance (e.g., 2.0)
+                - phi_spot: Spot trading fee rate (e.g., 0.0005 = 5bps for Uniswap 0.05%)
+                - phi_perp: Perp trading fee rate (e.g., 0.00045 = 4.5bps HL base tier)
+                - spot_impact_a: Empirical spot impact coefficient (default 0.00464)
+                - spot_impact_b: Empirical spot impact exponent (default 0.6778)
+                - alpha_perp: Perp impact scale (Gatheral, e.g., 0.0008)
+                - beta: Perp impact convexity (Gatheral, e.g., 1.3)
+                - c_reb: Rebalancing frequency constant (e.g., 0.733)
+                - c_fixed: Fixed cost per rebalance in USD (e.g., 2.0)
                 - rate_curve: Dict with {r0, r1, r2, U_kink}
+
+        Spot impact uses empirical model fitted from 1.8M real Uniswap V3
+        swaps (USDC/WETH & WETH/USDT, 0.05% pools, Oct 2023 – Dec 2024):
+
+            spot_slippage_bps(size) = phi_spot*10000 + a × size^b
+
+        where a=0.00464, b=0.6778 (P95 fit, R²=0.85). The pool fee
+        (phi_spot) is already included in the Uniswap execution price,
+        so phi_spot here represents the fee component and the power law
+        captures the additional AMM curve slippage.
+
+        Perp impact still uses the Gatheral (2010) model since Hyperliquid
+        is an order book, not an AMM.
         """
         self.params = params
         self._validate_params()
-    
+
     def _validate_params(self):
         """Validate all required parameters present."""
         required = [
-            'phi_spot', 'phi_perp', 'alpha_spot', 'alpha_perp',
-            'beta', 'c_reb', 'c_fixed', 'rate_curve'
+            'phi_spot', 'phi_perp',
+            'c_reb', 'c_fixed', 'rate_curve'
         ]
         for param in required:
             if param not in self.params:
                 raise ValueError(f"Missing required parameter: {param}")
+
+        # Defaults for empirical spot impact (from Uniswap data)
+        self.params.setdefault('spot_impact_a', 0.00463667)
+        self.params.setdefault('spot_impact_b', 0.6778)
+        # Defaults for Gatheral perp impact
+        self.params.setdefault('alpha_perp', 0.0008)
+        self.params.setdefault('beta', 1.3)
+        # Legacy: keep alpha_spot for backward compat but not used
+        self.params.setdefault('alpha_spot', 0.001)
     
     def gross_carry(self, Q, L, funding_rate, epoch_duration=8/8760):
         """
@@ -105,6 +128,10 @@ class VaultCostModel:
         """
         Trading fees per rebalance.
 
+        Note: spot fee (phi_spot) is already included in the empirical
+        spot slippage model inside impact_cost(). Only the perp fee
+        is counted here to avoid double-counting.
+
         Args:
             Q: Vault size
             epsilon: Rebalancing band (fraction of position to correct)
@@ -112,26 +139,50 @@ class VaultCostModel:
         Returns:
             Fee cost per rebalance (USD)
         """
-        # Each side has capital Q/2; rebalance trade per side = epsilon * Q/2
         trade_size = epsilon * (Q / 2)
 
-        fee_spot = self.params['phi_spot'] * trade_size
+        # Only perp fee — spot fee is inside the empirical impact model
         fee_perp = self.params['phi_perp'] * trade_size
 
-        return fee_spot + fee_perp
+        return fee_perp
     
+    def spot_slippage_bps(self, trade_size_usd):
+        """
+        Empirical spot slippage from real Uniswap V3 data.
+
+        Fitted from 1.8M swaps across USDC/WETH & WETH/USDT 0.05% pools
+        (Oct 2023 – Dec 2024). P95 model, R²=0.85.
+
+        The pool fee (phi_spot) is included as the constant term.
+        The power law captures additional AMM curve slippage beyond the fee.
+
+        Args:
+            trade_size_usd: Trade size in USD
+
+        Returns:
+            Slippage in basis points
+        """
+        fee_bps = self.params['phi_spot'] * 10000  # e.g., 5.0 bps
+        a = self.params['spot_impact_a']
+        b = self.params['spot_impact_b']
+        curve_bps = a * trade_size_usd ** b
+        return fee_bps + curve_bps
+
     def impact_cost(self, Q, epsilon, D_spot, D_perp):
         """
         Market impact (slippage) per rebalance.
 
-        Power-law model: fractional impact = α × (size / D)^β
-        Dollar impact = size × α × (size / D)^β
+        Spot side: empirical model from real Uniswap V3 swap data.
+            cost = slippage_bps(trade_size) / 10000 × trade_size
+
+        Perp side: Gatheral (2010) power-law model (Hyperliquid is an
+        order book, not an AMM, so empirical AMM model doesn't apply).
+            cost = α × trade_size × (trade_size / D_perp)^β
 
         Args:
             Q: Vault size
-            L: Leverage
             epsilon: Rebalancing band
-            D_spot: Spot market depth (USD)
+            D_spot: Spot market depth (USD) — unused in empirical model
             D_perp: Perp market depth (USD)
 
         Returns:
@@ -139,14 +190,11 @@ class VaultCostModel:
         """
         trade_size = epsilon * (Q / 2)
 
-        # Spot impact
-        impact_spot = (
-            self.params['alpha_spot'] *
-            trade_size *
-            (trade_size / D_spot) ** self.params['beta']
-        )
+        # Spot impact: empirical Uniswap model
+        spot_slip_bps = self.spot_slippage_bps(trade_size)
+        impact_spot = (spot_slip_bps / 10000) * trade_size
 
-        # Perp impact
+        # Perp impact: Gatheral model (order book)
         impact_perp = (
             self.params['alpha_perp'] *
             trade_size *
@@ -362,18 +410,22 @@ def test_cost_model():
     
     print("Testing VaultCostModel...\n")
     
-    # Model parameters — must match calibrated_params.json produced by
-    # 03_calibration.py.  c_reb = 0.746 is the Monte-Carlo-calibrated
-    # barrier-crossing constant; impact parameters are literature values
-    # from Gatheral (2010), validated against Hyperliquid L2 snapshots.
+    # Model parameters:
+    # - Spot impact: empirical model from 1.8M real Uniswap V3 swaps
+    #   (USDC/WETH & WETH/USDT 0.05% pools, Oct 2023 – Dec 2024)
+    # - Perp impact: Gatheral (2010), validated against Hyperliquid L2
+    # - c_reb: Monte-Carlo-calibrated barrier-crossing constant
+    # - phi_spot: Uniswap 0.05% pool fee (included in empirical model)
+    # - phi_perp: Hyperliquid base tier taker fee
     params = {
-        'phi_spot': 0.0004,      # 4 bps
-        'phi_perp': 0.0004,      # 4 bps
-        'alpha_spot': 0.001,     # Impact scale (Gatheral 2010)
-        'alpha_perp': 0.0008,    # Impact scale (Gatheral 2010)
-        'beta': 1.3,             # Convexity (crypto β ≈ 1.2–1.5)
-        'c_reb': 0.746,          # Calibrated via Monte Carlo (03_calibration.py)
-        'c_fixed': 2.0,          # $2 per rebalance (Arbitrum gas)
+        'phi_spot': 0.0005,          # 5 bps (Uniswap 0.05% pool fee)
+        'phi_perp': 0.00045,         # 4.5 bps (Hyperliquid base tier taker)
+        'spot_impact_a': 0.00463667, # Empirical: fitted from real swaps
+        'spot_impact_b': 0.6778,     # Empirical: P95 power-law exponent
+        'alpha_perp': 0.0008,        # Perp impact scale (Gatheral 2010)
+        'beta': 1.3,                 # Perp impact convexity
+        'c_reb': 0.746,              # Calibrated via Monte Carlo (03_calibration.py)
+        'c_fixed': 2.0,              # $2 per rebalance (Arbitrum gas)
         'rate_curve': {
             'r0': 0.00,
             'r1': 0.04,

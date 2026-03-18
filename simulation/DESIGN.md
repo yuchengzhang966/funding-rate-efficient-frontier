@@ -84,14 +84,44 @@ L_eff = total_ETH_value / C = aave_capital / ((1 - r) × C)
 HF = (total_ETH_value × liquidation_threshold) / debt
    = liquidation_threshold / r
 
-For HF ≥ 1.2:  r ≤ 0.825/1.2 = 0.6875
-For HF ≥ 1.5:  r ≤ 0.825/1.5 = 0.55
+For HF ≥ 1.2:  r ≤ liquidation_threshold / 1.2
+For HF ≥ 1.5:  r ≤ liquidation_threshold / 1.5
 ```
 
-**Maximum leverage** (with E-mode off, LTV=80%):
+This matches Aave's official single-collateral health factor formula:
+
 ```
-L_max = aave_capital / ((1 - 0.80) × C)
-      = (C - perp_margin) / (0.20 × C)
+HF = (Total Collateral Value × Weighted Average Liquidation Threshold) / Total Borrow Value
+```
+
+For this simulator's single-collateral setup, the weighted average liquidation threshold
+reduces to the liquidation threshold of the collateral asset itself.
+
+**Real Aave reference values to plug in**
+
+These values are governance-controlled and can change over time, so the simulator and
+examples should not hardcode stale assumptions without citing a source.
+
+- **WETH on Aave V3 Arbitrum:** LTV = 82.5%, liquidation threshold = 85.0%
+  - Source: Aave governance risk-parameter alignment proposal
+  - https://governance.aave.com/t/arfc-chaos-labs-risk-parameter-updates-ltv-and-lt-alignment/18997
+- **tBTC on Aave V3 Arbitrum:** LTV = 73.0%, liquidation threshold = 78.0%
+  - Source: Aave governance onboarding proposal
+  - https://governance.aave.com/t/arfc-onboard-tbtc-to-aave-v3-on-ethereum-arbitrum-and-optimism/17686
+- **Official health factor reference:**
+  - https://aave.com/help/borrowing/liquidations
+
+Using the verified WETH Arbitrum values:
+
+```
+For HF ≥ 1.2:  r ≤ 0.85/1.2 = 0.7083
+For HF ≥ 1.5:  r ≤ 0.85/1.5 = 0.5667
+```
+
+**Maximum leverage** (with WETH on Arbitrum, E-mode off, LTV=82.5%):
+```
+L_max = aave_capital / ((1 - 0.825) × C)
+      = (C - perp_margin) / (0.175 × C)
 ```
 
 **Perp margin ratio:**
@@ -110,38 +140,38 @@ Want: L_eff = 2.0, with HF ≥ 1.2
 L_eff = (C - M) / ((1-r) × C) = 2.0
 where M = perp_margin
 
-HF = 0.825 / r ≥ 1.2  →  r ≤ 0.6875
+HF = 0.85 / r ≥ 1.2  →  r ≤ 0.7083
 ```
 
 Need: `(100k - M) / ((1-r) × 100k) = 2.0`
 
-With target HF = 1.2 → r = 0.6875:
+With target HF = 1.2 → r = 0.7083:
 ```
-(100k - M) / (0.3125 × 100k) = 2.0
-100k - M = 62,500
-M = 37,500
+(100k - M) / (0.2917 × 100k) = 2.0
+100k - M = 58,333
+M = 41,667
 ```
 
 **Step 2: Execute**
 ```
-perp_margin = $37,500
-aave_capital = $62,500
+perp_margin = $41,667
+aave_capital = $58,333
 
-Buy $62,500 / $3,500 = 17.86 ETH
-Supply to Aave → borrow at 68.75% LTV → buy more → loop...
-Total ETH after loop = $62,500 / (1 - 0.6875) = $200,000 → 57.14 ETH
-Total Aave debt = $200,000 - $62,500 = $137,500
+Buy $58,333 / $3,500 = 16.67 ETH
+Supply to Aave → borrow at 70.83% LTV → buy more → loop...
+Total ETH after loop = $58,333 / (1 - 0.7083) ≈ $200,000 → 57.14 ETH
+Total Aave debt = $200,000 - $58,333 ≈ $141,667
 
-Short 57.14 ETH perp on Hyperliquid, margin = $37,500
-Margin ratio = $37,500 / $200,000 = 18.75%
-HF = 0.825 / 0.6875 = 1.20
+Short 57.14 ETH perp on Hyperliquid, margin = $41,667
+Margin ratio = $41,667 / $200,000 = 20.83%
+HF = 0.85 / 0.7083 ≈ 1.20
 ```
 
 **Result:**
 - Funding earned on $200k notional → 2× rate on $100k capital ✓
 - Delta neutral: 57.14 ETH long = 57.14 ETH short ✓
 - HF = 1.20 (acceptable) ✓
-- Perp margin ratio = 18.75% (healthy) ✓
+- Perp margin ratio = 20.83% (healthier than the old 18.75% example) ✓
 
 ### Without Aave, Same Capital
 
@@ -162,12 +192,12 @@ Funding earned is **4× less** than the leveraged version.
 
 **Perp side:**
 - Short loses: 57.14 ETH × ($4200 - $3500) = -$40,000
-- Margin was $37,500 → equity = -$2,500 → **LIQUIDATED** on HL before this
+- Margin was $41,667 → equity = $1,667 → likely near/below maintenance depending on venue rules
 
 **Aave side:**
 - Collateral worth: 57.14 × $4200 = $240,000 (up from $200k)
-- Debt unchanged: $137,500
-- HF = ($240,000 × 0.825) / $137,500 = 1.44 (improved!)
+- Debt unchanged: $141,667
+- HF = ($240,000 × 0.85) / $141,667 = 1.44 (improved!)
 
 **The problem:** HL gets liquidated before the Aave side benefits.
 
@@ -180,12 +210,12 @@ Funding earned is **4× less** than the leveraged version.
 
 **Perp side:**
 - Short gains: 57.14 × ($3500 - $2800) = +$40,000
-- Margin = $37,500 + $40,000 = $77,500 (very healthy)
+- Margin = $41,667 + $40,000 = $81,667 (very healthy)
 
 **Aave side:**
 - Collateral worth: 57.14 × $2800 = $160,000
-- Debt: $137,500
-- HF = ($160,000 × 0.825) / $137,500 = 0.96 → **LIQUIDATED** on Aave!
+- Debt: $141,667
+- HF = ($160,000 × 0.85) / $141,667 = 0.96 → **LIQUIDATED** on Aave!
 
 **Solution:** Rebalancing:
 - When Aave HF drops (say below 1.3), repay debt using excess HL margin
@@ -193,10 +223,89 @@ Funding earned is **4× less** than the leveraged version.
 
 ## Implementation Plan
 
-### 1. `HyperliquidAccount` class (existing, mostly correct)
+### 1. `HyperliquidAccount` class (existing, simplified)
 - Tracks: margin, position size, entry price, unrealized PnL, funding, fees
 - Methods: deposit, open_short, close_short, mark_to_market, receive_funding
-- Liquidation: when equity / notional < 3% maintenance margin
+- Uses mark-price-based liquidation checks
+- Current simulator simplification: treats liquidation as a single threshold event
+
+**Real Hyperliquid liquidation logic to model**
+
+Official docs:
+- Liquidations: https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations
+- Margining: https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margining
+- Margin tiers: https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margin-tiers
+
+Key points from the docs:
+- Hyperliquid liquidates on **mark price**, not raw order book price.
+- In **cross margin**, liquidation is based on **account value including unrealized PnL** versus maintenance margin requirements.
+- Maintenance margin is **not a universal fixed 3% for ETH**. It is derived from the asset's max leverage and margin tier:
+  - maintenance margin rate = half of initial margin at max leverage
+  - for tiered assets, maintenance requirement follows the tier schedule and deduction rules from the docs
+- Liquidation is **staged**, not always an instant full close:
+  - first, a liquidation order is sent to the book
+  - if that fully or partially reduces the position enough to restore requirements, the account continues
+  - if equity falls below **2/3 of maintenance margin**, backstop liquidation can take over
+- For liquidatable positions above **$100k notional**, Hyperliquid initially liquidates only **20%** of the position, then waits through the cooldown before another liquidation attempt
+- Hyperliquid docs do **not** describe liquidation as a flat 0.5% fee on every liquidation. Normal liquidation-through-the-book and backstop liquidation should be modeled separately.
+
+**Main simplification we are currently making**
+
+For the first simulator version, it is acceptable to approximate Hyperliquid liquidation as:
+
+```
+if account_equity < maintenance_margin_requirement:
+    trigger liquidation event
+```
+
+But the design doc should explicitly label this as a simplification. A more realistic version should:
+
+```
+1. compute maintenance margin from the asset's current margin tier
+2. use mark price to compute account value and maintenance requirement
+3. if under maintenance:
+   - liquidate part or all of the position via the book
+   - only treat as terminal/backstop liquidation if the account remains below the critical threshold
+```
+
+**Real Hyperliquid transaction costs to model**
+
+Official docs:
+- Fees: https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees
+- Builder codes: https://hyperliquid.gitbook.io/hyperliquid-docs/trading/builder-codes
+- Entry price and pnl: https://hyperliquid.gitbook.io/hyperliquid-docs/trading/entry-price-and-pnl
+
+Key points from the docs:
+- Fees are based on **rolling 14-day weighted volume** and are assessed under a tiered schedule.
+- There are separate fee schedules for **perps** and **spot**.
+- For perps, the current base fee tier is:
+  - taker = **0.045%**
+  - maker = **0.015%**
+- The frequently used `0.035% taker` assumption is **not** the default base rate. It corresponds to a higher fee tier (`> $25M` weighted volume over 14 days).
+- Perp maker fees fall with fee tier and become **0.000%** for higher tiers.
+- Additional modifiers can apply:
+  - referral discounts
+  - staking-tier discounts
+  - builder fees
+  - HIP-3 / deployer fee-share logic on some markets
+- Hyperliquid's PnL accounting is margin-based. Closing-trade fees should be applied directly to account value/margin rather than treated as a separate abstract cost bucket.
+
+**Recommended first-pass simulator assumptions**
+
+Unless we model user-specific fee tier and referral/staking status, use the base maker fee:
+
+```
+Conservative default:
+    taker_fee = 0.045%
+    maker_fee = 0.015%
+
+Active-trader assumption:
+    taker_fee = 0.035%
+    maker_fee = 0.015%
+```
+
+If we keep using `0.035% taker` in code, the documentation should say that this assumes at least VIP tier 2 / `> $25M` rolling weighted volume, not a default Hyperliquid account.
+If we ever use maker fees below `0.015%`, we should document the exact Hyperliquid fee tier that justifies it.
 
 ### 2. `AavePosition` class (existing, mostly correct)
 - Tracks: collateral ETH, debt USDC, interest accrual
@@ -247,7 +356,7 @@ elif mode == "leveraged":
 for each hour:
     1. Update Aave collateral value (ETH price changed)
     2. Update HL unrealized PnL (ETH price changed)
-    3. Check HL liquidation (margin_ratio < 3%)
+    3. Check HL liquidation state using mark price and tier-based maintenance margin
     4. Check Aave liquidation (HF < 1.0)
     5. Receive funding payment (funding_rate × notional)
     6. Accrue Aave interest (borrow rate on debt, supply rate on collateral)
@@ -260,7 +369,7 @@ for each hour:
 
 **Rebalancing logic:**
 ```
-HL_MARGIN_THRESHOLD = 0.08   # Rebalance when margin ratio < 8%
+HL_MARGIN_THRESHOLD = 0.08   # Conservative buffer above maintenance
 HL_MARGIN_TARGET = 0.15      # Target 15% after rebalance
 AAVE_HF_THRESHOLD = 1.15     # Rebalance when HF < 1.15
 AAVE_HF_TARGET = 1.30        # Target 1.30 after rebalance
@@ -304,6 +413,9 @@ def reduce_position(fraction):
     spot_eth -= reduce_eth
 ```
 
+Note: `HL_MARGIN_THRESHOLD = 8%` is a **risk buffer chosen by us**, not a Hyperliquid liquidation constant.
+The real liquidation boundary depends on the asset's current maintenance requirement under Hyperliquid's margin-tier rules.
+
 ### 4. Output / Tracking
 
 Each timestep records:
@@ -336,13 +448,39 @@ Each timestep records:
 }
 ```
 
-### 5. Slippage Model (Future: Uniswap S3 Data)
+### 5. Slippage / Transaction Cost Model
 
-Currently using flat fee (0.035% taker). Future enhancement:
+Current documentation assumptions should distinguish between:
+- **Hyperliquid exchange fees** on perp trades
+- **execution slippage / market impact**
+- **liquidation-path costs** if a forced close occurs
+
+For Hyperliquid perp fees, the official fee schedule is tiered by 14-day weighted volume.
+If no user-specific tier is provided, use the official base fee tier by default:
+
+```
+Perps base tier:
+    taker_fee = 0.045%
+    maker_fee = 0.015%
+```
+
+Optional modeling shortcut:
+
+```
+If simulating an active high-volume account:
+    taker_fee = 0.035%
+    maker_fee = 0.015%
+```
+
+This shortcut should be labeled as a **VIP-tier taker assumption**, not as a generic Hyperliquid default.
+Lower maker fees should only be used if we also model the corresponding Hyperliquid fee tier explicitly.
+
+Future enhancement:
 - Load real Uniswap swap data from S3
 - Build empirical curve: `swap_size → realized_slippage`
 - Include MEV/sandwich attack costs
 - Apply this to every trade (open, close, rebalance)
+- Combine slippage with Hyperliquid maker/taker fees for total transaction cost per rebalance
 
 ### 6. Input Data Format
 
